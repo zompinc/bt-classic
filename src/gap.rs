@@ -183,8 +183,8 @@ impl Eir {
         if len > data.len() {
             return Err(EirFull);
         }
-        for (chunk, uuid) in data.chunks_exact_mut(2).zip(uuids) {
-            chunk.copy_from_slice(&uuid.to_le_bytes());
+        for (chunk, uuid) in data.as_chunks_mut::<2>().0.iter_mut().zip(uuids) {
+            *chunk = uuid.to_le_bytes();
         }
         self.push(eir_type::UUID16_COMPLETE, &data[..len])
     }
@@ -197,8 +197,8 @@ impl Eir {
         if len > data.len() {
             return Err(EirFull);
         }
-        for (chunk, uuid) in data.chunks_exact_mut(16).zip(uuids) {
-            chunk.copy_from_slice(&uuid.to_le_bytes());
+        for (chunk, uuid) in data.as_chunks_mut::<16>().0.iter_mut().zip(uuids) {
+            *chunk = uuid.to_le_bytes();
         }
         self.push(eir_type::UUID128_COMPLETE, &data[..len])
     }

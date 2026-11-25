@@ -163,16 +163,13 @@ fn print_result(bd_addr: &BdAddr, class_of_device: [u8; 3], rssi: i8, eir: &[u8]
     for (data_type, data) in gap::eir_structures(eir) {
         match data_type {
             eir_type::UUID16_COMPLETE | eir_type::UUID16_INCOMPLETE => {
-                for uuid in data.chunks_exact(2) {
-                    println!(
-                        "     service 0x{:04x}",
-                        u16::from_le_bytes([uuid[0], uuid[1]])
-                    );
+                for uuid in data.as_chunks::<2>().0 {
+                    println!("     service 0x{:04x}", u16::from_le_bytes(*uuid));
                 }
             }
             eir_type::UUID128_COMPLETE | eir_type::UUID128_INCOMPLETE => {
-                for uuid in data.chunks_exact(16) {
-                    let value = u128::from_le_bytes(uuid.try_into().unwrap());
+                for uuid in data.as_chunks::<16>().0 {
+                    let value = u128::from_le_bytes(*uuid);
                     println!("     service {}", uuid128(value));
                 }
             }
