@@ -51,7 +51,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Google's Bumble, an independent host stack, checks the SDP server.
+      # Google's Bumble, an independent host stack, checks SDP and RFCOMM.
       - name: Bumble
         run: python -m pip install --quiet bumble==0.0.236
 
@@ -59,7 +59,7 @@ jobs:
       # virtual radio: host-h4 brings one up, the inquiry example must find
       # the discoverable one and read its name, the pair example must pair
       # with it, then reconnect on the bond, and Bumble must read its SDP
-      # records.
+      # records and get its data echoed over RFCOMM.
       - name: Against rootcanal
         run: |
           sh scripts/rootcanal.sh < /dev/null > rootcanal.log 2>&1 &
@@ -75,6 +75,7 @@ jobs:
           timeout 60 target/debug/examples/inquiry --seconds 3 --expect bt-classic --btsnoop inquiry.btsnoop
           timeout 120 target/debug/examples/pair --quiet --expect bt-classic --rounds 2 --btsnoop pair.btsnoop
           timeout 120 python tests/peer/sdp_check.py tcp-client:127.0.0.1:6402 bt-classic
+          timeout 120 python tests/peer/rfcomm_check.py tcp-client:127.0.0.1:6402 bt-classic
 
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
