@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 
 use bt_classic::gap;
+use bt_classic::gap::ControllerInfo;
 use bt_classic::host::Handler;
+use bt_classic::l2cap::ChannelEvent;
 use bt_classic::security::{
     Action, ConfirmRequest, LinkKeyStore, MemoryKeyStore, Notice, StoredKey,
 };
@@ -99,6 +101,7 @@ pub fn parse_addr(text: &str) -> Option<BdAddr> {
 
 /// What the console handler passes on to an example's procedure.
 pub enum Progress {
+    Ready(ControllerInfo),
     Notice(Notice),
     Found {
         bd_addr: BdAddr,
@@ -115,6 +118,27 @@ pub struct Console {
 }
 
 impl Handler for Console {
+    fn ready(&mut self, info: &ControllerInfo) {
+        println!(
+            "   ready at {}, ACL buffers {} x {} bytes",
+            addr(&info.bd_addr),
+            info.total_num_acl_data_packets,
+            info.acl_data_packet_length,
+        );
+        let _ = self.tx.send(Progress::Ready(*info));
+    }
+
+    fn channel(&mut self, event: ChannelEvent) {
+        let (what, channel) = match event {
+            ChannelEvent::Opened(c) => ("opened", c),
+            ChannelEvent::Closed(c) => ("closed", c),
+        };
+        println!(
+            "   L2CAP channel {what}: PSM 0x{:04x}, local 0x{:04x}, remote 0x{:04x}, peer MTU {}",
+            channel.psm, channel.local_cid, channel.remote_cid, channel.remote_mtu
+        );
+    }
+
     fn event(&mut self, event: &Event<'_>) {
         match event {
             Event::ExtendedInquiryResult(e) => {
