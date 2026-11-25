@@ -9,4 +9,5 @@
 #![no_std]
 
 pub mod cmd;
+pub mod gap;
 pub mod trace;
