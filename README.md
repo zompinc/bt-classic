@@ -21,7 +21,7 @@ cargo build
 cargo test
 ```
 
-The library builds for any target, `no_std` included; tests and examples run on the host.
+The library builds for any target, `no_std` included; tests and examples run on the host. `rust-toolchain.toml` pins the Rust version CI uses, and rustup installs it on the first build. Firmware for the ESP32 will need Espressif's Xtensa toolchain, so it will live in its own directory with its own toolchain file.
 
 ## Run against a virtual controller
 
