@@ -52,8 +52,9 @@ jobs:
           python-version: "3.12"
 
       # rootcanal gives each TCP connection its own controller, all on one
-      # virtual radio: host-h4 brings one up, then the inquiry example must
-      # find the discoverable one and read its name.
+      # virtual radio: host-h4 brings one up, the inquiry example must find
+      # the discoverable one and read its name, and the pair example must
+      # pair with it, then reconnect on the bond.
       - name: Against rootcanal
         run: |
           sh scripts/rootcanal.sh < /dev/null > rootcanal.log 2>&1 &
@@ -67,6 +68,7 @@ jobs:
           target/debug/examples/discoverable --quiet --btsnoop discoverable.btsnoop < /dev/null > discoverable.log 2>&1 &
           sleep 3
           timeout 60 target/debug/examples/inquiry --seconds 3 --expect bt-classic --btsnoop inquiry.btsnoop
+          timeout 120 target/debug/examples/pair --quiet --expect bt-classic --rounds 2 --btsnoop pair.btsnoop
 
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}

@@ -8,10 +8,12 @@ See [docs/design.md](docs/design.md) for the research behind it, the layout and 
 
 ## Status
 
-Milestone 1: a controller comes up discoverable and connectable, with a name, Class of Device and EIR, and other devices find it. Connections, pairing, L2CAP, SDP and RFCOMM come next.
+Milestone 2: a controller comes up discoverable and connectable, accepts connections, pairs with Secure Simple Pairing (Just Works or numeric comparison), stores link keys and reconnects bonded devices without pairing again. L2CAP, SDP and RFCOMM come next.
 
+- `host`: the async runner (`host::run`) that reads the controller, drives pairing and sends the replies, with a `Handler` for progress and numeric-comparison prompts.
+- `security`: the pairing state machine, with no I/O, and the `LinkKeyStore` trait (`MemoryKeyStore` keeps keys in RAM).
 - `gap`: the bring-up sequence (`gap::bring_up`), Class of Device, the local name, and building and parsing EIR data.
-- `cmd`: BR/EDR HCI commands that [bt-hci](https://github.com/embassy-rs/bt-hci) does not define yet: name, scan enable and activity, Class of Device, inquiry mode, EIR, Simple Pairing mode, Secure Connections host support, buffer size.
+- `cmd`: BR/EDR HCI commands that [bt-hci](https://github.com/embassy-rs/bt-hci) does not define yet: PIN code negative reply, name, scan enable and activity, Class of Device, inquiry mode, EIR, Simple Pairing mode, Secure Connections host support, buffer size.
 - `trace`: wraps an H4 reader or writer, hands each HCI packet to a sink, and encodes btsnoop captures for Wireshark.
 
 ## Build
@@ -36,8 +38,9 @@ Each TCP connection to rootcanal gets its own controller on one shared virtual r
 
 ```sh
 cargo run --example host-h4                      # version, address, features, buffer sizes
-cargo run --example discoverable -- --quiet      # stays discoverable until stopped
+cargo run --example discoverable -- --quiet --keys target/keys.txt   # accepts and pairs until stopped
 cargo run --example inquiry -- --expect bt-classic   # finds it and reads its name
+cargo run --example pair -- --expect bt-classic      # pairs, then reconnects on the bond
 ```
 
 Every example prints the HCI packets it exchanges (`--quiet` turns that off) and takes `--btsnoop FILE` to write a capture that Wireshark decodes, and an optional `HOST:PORT` for a controller elsewhere.
