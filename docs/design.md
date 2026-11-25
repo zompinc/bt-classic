@@ -126,4 +126,4 @@ Design rules:
 - Which IO capability does the AA handshake need? Commercial AA dongles pair Just Works; confirm the phone does not insist on numeric comparison.
 - Whether the phone needs the HSP record only in SDP or an actual HSP RFCOMM connection to proceed. aa-dongle's BlueZ code accepts the HSP connection and does nothing with it.
 - Whether Secure Connections (P-256) on the ESP32 controller works through VHCI; Simple Pairing with P-192 is the fallback.
-- License and GitHub remote for this repo: not chosen yet.
+- Publishing to crates.io: not yet; the crate stays `publish = false` until there is something to use.
