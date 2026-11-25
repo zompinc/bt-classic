@@ -16,10 +16,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-          targets: riscv32imc-unknown-none-elf
+      # The version, components and targets come from rust-toolchain.toml,
+      # the same file local builds use.
+      - name: Rust toolchain
+        run: |
+          if ! command -v rustup > /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install
+          rustc --version
 
       - uses: Swatinem/rust-cache@v2
         if: ${{ !env.ACT }}

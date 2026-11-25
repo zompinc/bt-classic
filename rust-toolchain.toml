@@ -1,0 +1,7 @@
+# The toolchain for local builds and CI alike, so clippy finds the same
+# things in both. Bump it deliberately, in its own commit.
+[toolchain]
+channel    = "1.100.0"
+components = ["rustfmt", "clippy"]
+targets    = ["riscv32imc-unknown-none-elf"]
+profile    = "minimal"
