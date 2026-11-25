@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use bt_classic::cmd::{WriteInquiryMode, inquiry_mode};
 use bt_classic::gap::{self, ClassOfDevice, major};
-use bt_classic::host;
-use bt_classic::security::{Notice, Security, SecurityConfig};
+use bt_classic::host::{self, Stack};
+use bt_classic::security::{Notice, SecurityConfig};
 use bt_hci::cmd::link_control::{
     AuthenticationRequested, CreateConnection, Disconnect, Inquiry, SetConnectionEncryption,
 };
@@ -42,18 +42,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         common::exit_usage("pair --expect NAME [--rounds N] [--keys FILE] [--no-sc]");
     };
     let rounds: u32 = options.value("--rounds").map_or(Ok(2), str::parse)?;
-    let mut keys = KeyFile::open(options.value("--keys"))?;
+    let keys = KeyFile::open(options.value("--keys"))?;
     let hci = common::connect(&options).await?;
 
     let (tx, rx) = unbounded_channel();
     let mut console = Console { tx };
-    let mut security = Security::new(SecurityConfig {
+    let security = SecurityConfig {
         connectable: false,
         ..SecurityConfig::default()
-    });
-    let runner = host::run(&hci, &mut security, &mut keys, &mut console);
-    let secure_connections = !options.rest.iter().any(|a| a == "--no-sc");
-    let procedure = procedure(&hci, rx, &expected, rounds, secure_connections);
+    };
+    let mut stack = Stack::new(security, &[], keys);
+    let config = gap::Config {
+        name: "bt-classic-peer",
+        class_of_device: ClassOfDevice::new(0, major::PHONE, 0x03),
+        uuid16: &[],
+        uuid128: &[],
+        discoverable: false,
+        connectable: false,
+        secure_connections: !options.rest.iter().any(|a| a == "--no-sc"),
+    };
+    let runner = host::run(&hci, &mut stack, &config, &mut console);
+    let procedure = procedure(&hci, rx, &expected, rounds);
 
     let result = tokio::select! {
         result = procedure => result,
@@ -71,25 +80,14 @@ async fn procedure(
     mut rx: UnboundedReceiver<Progress>,
     expected: &str,
     rounds: u32,
-    secure_connections: bool,
 ) -> Result<(), String> {
     let fail = |what: &str| {
         let what = what.to_owned();
         move |e| format!("{what}: {e:?}")
     };
 
-    let config = gap::Config {
-        name: "bt-classic-peer",
-        class_of_device: ClassOfDevice::new(0, major::PHONE, 0x03),
-        uuid16: &[],
-        uuid128: &[],
-        discoverable: false,
-        connectable: false,
-        secure_connections,
-    };
-    gap::bring_up(hci, &config)
-        .await
-        .map_err(fail("bring-up"))?;
+    // The runner brings the controller up first.
+    while !matches!(next(&mut rx).await?, Progress::Ready(_)) {}
     hci.exec(&WriteInquiryMode::new(inquiry_mode::EXTENDED))
         .await
         .map_err(fail("inquiry mode"))?;

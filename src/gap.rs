@@ -5,7 +5,7 @@
 //! Class of Device, Extended Inquiry Response and scan enable.
 
 use bt_hci::cmd::Error;
-use bt_hci::cmd::controller_baseband::{Reset, SetEventMask};
+use bt_hci::cmd::controller_baseband::{HostBufferSize, Reset, SetEventMask};
 use bt_hci::cmd::info::ReadBdAddr;
 use bt_hci::controller::{Controller, ControllerCmdSync};
 use bt_hci::param::{BdAddr, EventMask};
@@ -299,6 +299,11 @@ pub struct Config<'a> {
     pub secure_connections: bool,
 }
 
+/// The largest ACL data packet the host accepts, told to the controller with
+/// Host_Buffer_Size so it splits longer ones. 255 fits bt-hci's read buffer
+/// with the 4-byte ACL header; L2CAP reassembles the pieces.
+pub const HOST_ACL_DATA_PACKET_LENGTH: u16 = 255;
+
 /// What [`bring_up`] learned about the controller.
 #[derive(Clone, Copy, Debug)]
 pub struct ControllerInfo {
@@ -316,6 +321,7 @@ pub trait ClassicController:
     Controller
     + ControllerCmdSync<Reset>
     + ControllerCmdSync<SetEventMask>
+    + ControllerCmdSync<HostBufferSize>
     + ControllerCmdSync<ReadBdAddr>
     + ControllerCmdSync<ReadBufferSize>
     + ControllerCmdSync<WriteSimplePairingMode>
@@ -331,6 +337,7 @@ impl<C> ClassicController for C where
     C: Controller
         + ControllerCmdSync<Reset>
         + ControllerCmdSync<SetEventMask>
+        + ControllerCmdSync<HostBufferSize>
         + ControllerCmdSync<ReadBdAddr>
         + ControllerCmdSync<ReadBufferSize>
         + ControllerCmdSync<WriteSimplePairingMode>
@@ -352,6 +359,12 @@ pub async fn bring_up<C: ClassicController>(
     config: &Config<'_>,
 ) -> Result<ControllerInfo, Error<C::Error>> {
     controller.exec(&Reset::new()).await?;
+    // Without host flow control the counts are unused, but the controller
+    // must still split ACL data to this length (Core v5.4, Vol 4, Part E,
+    // 7.3.39).
+    controller
+        .exec(&HostBufferSize::new(HOST_ACL_DATA_PACKET_LENGTH, 64, 8, 1))
+        .await?;
     controller
         .exec(&SetEventMask::new(classic_event_mask()))
         .await?;

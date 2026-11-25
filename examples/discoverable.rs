@@ -1,34 +1,56 @@
 //! Brings a controller up as a discoverable, connectable classic device that
-//! accepts connections and pairs (Just Works), and prints what happens until
-//! stopped.
+//! accepts connections, pairs (Just Works) and answers SDP queries, and
+//! prints what happens until stopped.
 //!
 //! ```sh
 //! cargo run --example discoverable -- --name bt-classic --keys target/discoverable-keys.txt
 //! ```
 //!
-//! It advertises an HSP headset and the wireless Android Auto service in its
-//! EIR, as the dongle will. With `--keys FILE`, link keys are kept in that
-//! file, so bonded devices reconnect without pairing after a restart.
+//! It advertises and serves the records the dongle needs: the wireless
+//! Android Auto service on RFCOMM channel 8 and an HSP headset on channel 6.
+//! Nothing listens on RFCOMM yet. With `--keys FILE`, link keys are kept in
+//! that file, so bonded devices reconnect without pairing after a restart.
 
 mod common;
 
 use bt_classic::gap::{self, ClassOfDevice, audio_video, major, service};
-use bt_classic::host;
-use bt_classic::security::{Security, SecurityConfig};
+use bt_classic::host::{self, Stack};
+use bt_classic::rfcomm_service_record;
+use bt_classic::sdp::{Attribute, DataElement, ServiceRecord, attribute, uuid};
+use bt_classic::security::SecurityConfig;
+use common::Options;
 use common::pairing::{Console, KeyFile};
-use common::{Options, addr};
 use tokio::sync::mpsc;
 
-/// HSP headset role.
-const HSP_HS: u16 = 0x1108;
 /// Wireless Android Auto's RFCOMM service.
 const ANDROID_AUTO: u128 = 0x4de17a00_52cb_11e6_bdf4_0800200c9a66;
+
+/// What aa-dongle registers with BlueZ as "AA Wireless", a server on
+/// channel 8.
+static AA_WIRELESS: ServiceRecord<'static> = rfcomm_service_record!(
+    handle: 0x0001_0001,
+    classes: [DataElement::Uuid128(ANDROID_AUTO)],
+    channel: 8,
+    name: "AA Wireless",
+);
+
+/// BlueZ's HSP headset (HS) record: Headset and Generic Audio, HSP 1.2.
+static HSP_HS: ServiceRecord<'static> = rfcomm_service_record!(
+    handle: 0x0001_0002,
+    classes: [DataElement::Uuid16(uuid::HEADSET), DataElement::Uuid16(uuid::GENERIC_AUDIO)],
+    channel: 6,
+    name: "Headset",
+    profiles: [DataElement::Sequence(&[DataElement::Uuid16(uuid::HEADSET), DataElement::U16(0x0102)])],
+    extra: [Attribute { id: attribute::REMOTE_AUDIO_VOLUME_CONTROL, value: DataElement::Bool(false) }],
+);
+
+static RECORDS: [ServiceRecord<'static>; 2] = [AA_WIRELESS, HSP_HS];
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse("discoverable [--name NAME] [--keys FILE] [--no-sc]");
     let name = options.value("--name").unwrap_or("bt-classic").to_owned();
-    let mut keys = KeyFile::open(options.value("--keys"))?;
+    let keys = KeyFile::open(options.value("--keys"))?;
     let hci = common::connect(&options).await?;
 
     let config = gap::Config {
@@ -38,35 +60,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             major::AUDIO_VIDEO,
             audio_video::WEARABLE_HEADSET,
         ),
-        uuid16: &[HSP_HS],
+        uuid16: &[uuid::HEADSET],
         uuid128: &[ANDROID_AUTO],
         discoverable: true,
         connectable: true,
         secure_connections: !options.rest.iter().any(|a| a == "--no-sc"),
     };
 
-    let device = async {
-        let info = gap::bring_up(&hci, &config)
-            .await
-            .map_err(|e| format!("bring-up failed: {e:?}"))?;
-        println!(
-            "   discoverable as {name:?} at {}, ACL buffers {} x {} bytes",
-            addr(&info.bd_addr),
-            info.total_num_acl_data_packets,
-            info.acl_data_packet_length,
-        );
-        std::future::pending::<Result<(), String>>().await
-    };
-
     // Progress is printed by the console; nothing here waits for it.
     let (tx, _rx) = mpsc::unbounded_channel();
     let mut console = Console { tx };
-    let mut security = Security::new(SecurityConfig::default());
-    let runner = host::run(&hci, &mut security, &mut keys, &mut console);
-
-    tokio::select! {
-        result = device => result?,
-        error = runner => return Err(format!("controller failed: {error:?}").into()),
-    }
-    Ok(())
+    let mut stack = Stack::new(SecurityConfig::default(), &RECORDS, keys);
+    let error = host::run(&hci, &mut stack, &config, &mut console).await;
+    Err(format!("controller failed: {error:?}").into())
 }

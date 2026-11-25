@@ -11,5 +11,7 @@
 pub mod cmd;
 pub mod gap;
 pub mod host;
+pub mod l2cap;
+pub mod sdp;
 pub mod security;
 pub mod trace;
