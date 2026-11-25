@@ -1,6 +1,6 @@
 # bt-classic design
 
-Status: research and proposal, written 2026-11-25. No stack code yet.
+Status: M0-M4 done on rootcanal (see Milestones); M5 (ESP32) next. Written 2026-11-25 as research and proposal.
 
 ## Goal
 
