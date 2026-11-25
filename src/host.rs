@@ -176,22 +176,16 @@ where
             if let Some(notice) = out.notice {
                 handler.notice(notice);
             }
-            if let Some(action) = out.action {
-                if let Err(e) = execute(controller, action).await {
-                    match e {
-                        Error::Io(e) => return Error::Io(e),
-                        Error::Hci(e) => handler.command_failed(action, e),
-                    }
-                }
+            if let Some(action) = out.action
+                && let Err(e) = reply(controller, handler, action).await
+            {
+                return e;
             }
             if let Some(request) = out.confirm {
                 let accept = handler.confirm(request).await;
-                let action = security.confirm(&request, accept);
-                if let Err(e) = execute(controller, action).await {
-                    match e {
-                        Error::Io(e) => return Error::Io(e),
-                        Error::Hci(e) => handler.command_failed(action, e),
-                    }
+                if let Err(e) = reply(controller, handler, security.confirm(&request, accept)).await
+                {
+                    return e;
                 }
             }
         }
@@ -199,6 +193,22 @@ where
 
     match select(reader, processor).await {
         Either::First(e) | Either::Second(e) => e,
+    }
+}
+
+/// Sends a reply; a refusal goes to the handler, only an I/O error is
+/// returned.
+async fn reply<C: PairingController, H: Handler>(
+    controller: &C,
+    handler: &mut H,
+    action: Action,
+) -> Result<(), Error<C::Error>> {
+    match execute(controller, action).await {
+        Err(Error::Hci(e)) => {
+            handler.command_failed(action, e);
+            Ok(())
+        }
+        other => other,
     }
 }
 
