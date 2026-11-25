@@ -17,6 +17,7 @@ dependencies = [
  "bt-hci-transport",
  "critical-section",
  "defmt 1.2.0",
+ "embassy-futures",
  "embassy-sync",
  "embedded-io",
  "embedded-io-adapters",
@@ -137,6 +138,12 @@ checksum = "71958f69fb2de856c5dd51ac9377e986ca1aa5919f931bf5395a807277f889a0"
 dependencies = [
  "thiserror",
 ]
+
+[[package]]
+name = "embassy-futures"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc2d050bdc5c21e0862a89256ed8029ae6c290a93aecefc73084b3002cdebb01"
 
 [[package]]
 name = "embassy-sync"
