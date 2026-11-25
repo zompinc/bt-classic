@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  ACT:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # Public repo: GitHub-hosted only; fork PRs must never reach a self-hosted runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: riscv32imc-unknown-none-elf
+
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !env.ACT }}
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features log -- -D warnings
+
+      - name: Unit tests
+        run: cargo test
+
+      # A bare-metal target proves the library stays no_std. The ESP32 itself
+      # (Xtensa) needs Espressif's toolchain, so it is not checked here.
+      - name: no_std build
+        run: |
+          cargo build --lib --target riscv32imc-unknown-none-elf
+          cargo build --lib --target riscv32imc-unknown-none-elf --features defmt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bring-up against rootcanal
+        run: |
+          sh scripts/rootcanal.sh < /dev/null > rootcanal.log 2>&1 &
+          # Wait for the HCI port; a bounded probe, since a connect can hang.
+          for _ in $(seq 1 120); do
+            timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/6402' 2>/dev/null && break
+            sleep 1
+          done
+          timeout 120 cargo run --example host-h4 -- 127.0.0.1:6402 --btsnoop host-h4.btsnoop
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: rootcanal-trace
+          path: |
+            rootcanal.log
+            host-h4.btsnoop
+          if-no-files-found: ignore
+          retention-days: 5
