@@ -17,6 +17,8 @@ bt-hci            = { version = "0.11", default-features = false }
 # Named by bt-hci's `cmd!` macro as `::bt_hci_transport`, so it must be a direct dependency.
 bt-hci-transport  = "0.1"
 defmt             = { version = "1", optional = true }
+embassy-futures   = "0.1"
+embassy-sync      = "0.8"
 embedded-io       = "0.7"
 embedded-io-async = "0.7"
 log               = { version = "0.4", optional = true }

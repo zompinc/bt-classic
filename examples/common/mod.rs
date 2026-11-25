@@ -3,6 +3,8 @@
 
 #![allow(dead_code)] // Not every example uses every helper.
 
+pub mod pairing;
+
 use std::fs::File;
 use std::io::Write as _;
 use std::sync::Mutex;

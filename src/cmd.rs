@@ -7,6 +7,8 @@
 //!
 //! Section numbers refer to Core v5.4, Vol 4, Part E.
 
+use bt_hci::param::BdAddr;
+
 /// `scan_enable` values for [`WriteScanEnable`] (7.3.18).
 pub mod scan_enable {
     /// Neither discoverable nor connectable.
@@ -27,6 +29,15 @@ pub mod inquiry_mode {
     pub const RSSI: u8 = 0x01;
     /// Extended Inquiry Result events, which carry the peer's EIR data.
     pub const EXTENDED: u8 = 0x02;
+}
+
+bt_hci::cmd! {
+    /// PIN Code Request Negative Reply command (7.1.13): refuses legacy
+    /// pairing.
+    PinCodeRequestNegativeReply(LINK_CONTROL, 0x000e) {
+        Params = BdAddr;
+        Return = BdAddr;
+    }
 }
 
 bt_hci::cmd! {
@@ -162,6 +173,7 @@ mod tests {
     #[test]
     fn opcodes() {
         let base = OpcodeGroup::CONTROL_BASEBAND;
+        assert_eq!(PinCodeRequestNegativeReply::OPCODE.to_raw(), 0x040e);
         assert_eq!(WriteLocalName::OPCODE.group(), base);
         assert_eq!(WriteLocalName::OPCODE.to_raw(), 0x0c13);
         assert_eq!(WriteScanEnable::OPCODE.to_raw(), 0x0c1a);

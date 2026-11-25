@@ -1,18 +1,23 @@
-//! Brings a controller up as a discoverable, connectable classic device and
-//! prints the events it gets until stopped.
+//! Brings a controller up as a discoverable, connectable classic device that
+//! accepts connections and pairs (Just Works), and prints what happens until
+//! stopped.
 //!
 //! ```sh
-//! cargo run --example discoverable -- --name bt-classic
+//! cargo run --example discoverable -- --name bt-classic --keys target/discoverable-keys.txt
 //! ```
 //!
 //! It advertises an HSP headset and the wireless Android Auto service in its
-//! EIR, as the dongle will. Connections are not accepted yet.
+//! EIR, as the dongle will. With `--keys FILE`, link keys are kept in that
+//! file, so bonded devices reconnect without pairing after a restart.
 
 mod common;
 
 use bt_classic::gap::{self, ClassOfDevice, audio_video, major, service};
-use bt_hci::event::Event;
+use bt_classic::host;
+use bt_classic::security::{Security, SecurityConfig};
+use common::pairing::{Console, KeyFile};
 use common::{Options, addr};
+use tokio::sync::mpsc;
 
 /// HSP headset role.
 const HSP_HS: u16 = 0x1108;
@@ -21,8 +26,9 @@ const ANDROID_AUTO: u128 = 0x4de17a00_52cb_11e6_bdf4_0800200c9a66;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let options = Options::parse("discoverable [--name NAME]");
+    let options = Options::parse("discoverable [--name NAME] [--keys FILE] [--no-sc]");
     let name = options.value("--name").unwrap_or("bt-classic").to_owned();
+    let mut keys = KeyFile::open(options.value("--keys"))?;
     let hci = common::connect(&options).await?;
 
     let config = gap::Config {
@@ -36,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         uuid128: &[ANDROID_AUTO],
         discoverable: true,
         connectable: true,
+        secure_connections: !options.rest.iter().any(|a| a == "--no-sc"),
     };
 
     let device = async {
@@ -51,21 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::future::pending::<Result<(), String>>().await
     };
 
-    let events = common::events(&hci, |event| {
-        match event {
-            Event::ConnectionRequest(e) => println!(
-                "   connection request from {}, class 0x{:06x} (not accepted yet)",
-                addr(&e.bd_addr),
-                ClassOfDevice(e.class_of_device).value(),
-            ),
-            other => println!("   event {other:?}"),
-        }
-        None::<()>
-    });
+    // Progress is printed by the console; nothing here waits for it.
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut console = Console { tx };
+    let mut security = Security::new(SecurityConfig::default());
+    let runner = host::run(&hci, &mut security, &mut keys, &mut console);
 
     tokio::select! {
         result = device => result?,
-        result = events => result?,
+        error = runner => return Err(format!("controller failed: {error:?}").into()),
     }
     Ok(())
 }

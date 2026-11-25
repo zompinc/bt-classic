@@ -10,4 +10,6 @@
 
 pub mod cmd;
 pub mod gap;
+pub mod host;
+pub mod security;
 pub mod trace;
