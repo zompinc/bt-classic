@@ -11,8 +11,8 @@ env:
 
 jobs:
   check:
-    # Private repo: self-hosted. Switch to ubuntu-latest if the repo goes public.
-    runs-on: [self-hosted, linux]
+    # Public repo: GitHub-hosted only; fork PRs must never reach a self-hosted runner.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
