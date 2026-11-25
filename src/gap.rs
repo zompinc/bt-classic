@@ -12,7 +12,7 @@ use bt_hci::param::{BdAddr, EventMask};
 
 use crate::cmd::{
     ReadBufferSize, WriteClassOfDevice, WriteExtendedInquiryResponse, WriteLocalName,
-    WriteScanEnable, WriteSimplePairingMode, scan_enable,
+    WriteScanEnable, WriteSecureConnectionsHostSupport, WriteSimplePairingMode, scan_enable,
 };
 
 /// A Class of Device (Assigned Numbers, 2.8): service classes plus a major and
@@ -293,6 +293,10 @@ pub struct Config<'a> {
     pub discoverable: bool,
     /// Answer pages.
     pub connectable: bool,
+    /// Turn on Secure Connections (P-256 pairing, AES-CCM encryption) when
+    /// the controller supports it. Needs Core 4.1 or later controller
+    /// support; leave it off for controllers that reject the command.
+    pub secure_connections: bool,
 }
 
 /// What [`bring_up`] learned about the controller.
@@ -315,6 +319,7 @@ pub trait ClassicController:
     + ControllerCmdSync<ReadBdAddr>
     + ControllerCmdSync<ReadBufferSize>
     + ControllerCmdSync<WriteSimplePairingMode>
+    + ControllerCmdSync<WriteSecureConnectionsHostSupport>
     + ControllerCmdSync<WriteClassOfDevice>
     + ControllerCmdSync<WriteLocalName>
     + ControllerCmdSync<WriteExtendedInquiryResponse>
@@ -329,6 +334,8 @@ impl<C> ClassicController for C where
         + ControllerCmdSync<ReadBdAddr>
         + ControllerCmdSync<ReadBufferSize>
         + ControllerCmdSync<WriteSimplePairingMode>
+        + ControllerCmdSync<WriteSecureConnectionsHostSupport>
+        + ControllerCmdSync<WriteSecureConnectionsHostSupport>
         + ControllerCmdSync<WriteClassOfDevice>
         + ControllerCmdSync<WriteLocalName>
         + ControllerCmdSync<WriteExtendedInquiryResponse>
@@ -353,6 +360,11 @@ pub async fn bring_up<C: ClassicController>(
     let buffers = controller.exec(&ReadBufferSize::new()).await?;
 
     controller.exec(&WriteSimplePairingMode::new(1)).await?;
+    if config.secure_connections {
+        controller
+            .exec(&WriteSecureConnectionsHostSupport::new(1))
+            .await?;
+    }
     controller
         .exec(&WriteClassOfDevice::new(config.class_of_device.0))
         .await?;
