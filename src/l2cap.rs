@@ -254,6 +254,11 @@ impl L2cap {
             .find(|c| c.local_cid == local_cid)
     }
 
+    /// How many more PDUs the outbox takes.
+    pub fn outbox_room(&self) -> usize {
+        self.outbox.iter().filter(|o| o.is_none()).count()
+    }
+
     /// PDUs dropped because the outbox was full.
     pub fn dropped(&self) -> u32 {
         self.dropped

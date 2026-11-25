@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hci = common::connect(&options).await?;
 
     let (tx, rx) = unbounded_channel();
-    let mut console = Console { tx };
+    let mut console = Console { tx, echo: false };
     let security = SecurityConfig {
         connectable: false,
         ..SecurityConfig::default()
