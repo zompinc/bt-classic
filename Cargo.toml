@@ -1,0 +1,9 @@
+[package]
+name         = "bt-classic"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.88"
+description  = "Bluetooth Classic (BR/EDR) host stack for no_std Rust: L2CAP, SDP and RFCOMM over HCI"
+publish      = false
+
+[dependencies]

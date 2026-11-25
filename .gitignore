@@ -1,0 +1,17 @@
+# Cargo build output
+/target/
+
+# Node tooling for the pre-commit hook
+node_modules/
+
+# Shared run and build configurations; personal editor settings stay local.
+/.vscode/*
+!/.vscode/settings.json
+!/.vscode/tasks.json
+!/.vscode/launch.json
+!/.vscode/extensions.json
+
+
+# Added by cargo
+
+/target
