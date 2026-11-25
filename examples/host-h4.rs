@@ -10,117 +10,18 @@
 //! Every packet is printed as hex; with `--btsnoop` they are also written to
 //! a capture that Wireshark opens.
 
-use std::error::Error;
-use std::fs::File;
-use std::io::Write as _;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+mod common;
 
 use bt_classic::cmd::ReadBufferSize;
-use bt_classic::trace::{Direction, Sink, Traced, btsnoop};
-use bt_hci::ControllerToHostPacket;
 use bt_hci::cmd::SyncCmd;
 use bt_hci::cmd::controller_baseband::Reset;
 use bt_hci::cmd::info::{ReadBdAddr, ReadLocalSupportedFeatures, ReadLocalVersionInformation};
-use bt_hci::controller::{Controller, ExternalController};
-use bt_hci_serial::SerialTransport;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embedded_io_adapters::tokio_1::FromTokio;
-use tokio::net::TcpStream;
-
-/// Prints each packet and, optionally, appends it to a btsnoop capture.
-struct Tracer {
-    capture: Option<Mutex<File>>,
-}
-
-impl Tracer {
-    fn new(path: Option<&str>) -> std::io::Result<Self> {
-        let capture = match path {
-            Some(path) => {
-                let mut file = File::create(path)?;
-                file.write_all(&btsnoop::FILE_HEADER)?;
-                Some(Mutex::new(file))
-            }
-            None => None,
-        };
-        Ok(Self { capture })
-    }
-}
-
-impl Sink for Tracer {
-    fn packet(&self, direction: Direction, packet: &[u8], original_len: usize) {
-        let arrow = match direction {
-            Direction::HostToController => "->",
-            Direction::ControllerToHost => "<-",
-        };
-        let shown = &packet[..packet.len().min(32)];
-        let hex: Vec<String> = shown.iter().map(|b| format!("{b:02x}")).collect();
-        let more = if original_len > shown.len() {
-            " ..."
-        } else {
-            ""
-        };
-        println!("{arrow} {}{more}", hex.join(" "));
-
-        if let Some(capture) = &self.capture {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_micros() as u64);
-            let header = btsnoop::record_header(direction, packet, original_len, now);
-            let mut file = capture.lock().unwrap();
-            let written = file
-                .write_all(&header)
-                .and_then(|()| file.write_all(packet));
-            if let Err(e) = written {
-                eprintln!("btsnoop write failed: {e}");
-            }
-        }
-    }
-}
-
-fn usage() -> ! {
-    eprintln!("usage: host-h4 [HOST:PORT] [--btsnoop FILE]");
-    std::process::exit(2);
-}
+use common::{Options, addr};
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let mut address = String::from("127.0.0.1:6402");
-    let mut capture = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--btsnoop" => capture = Some(args.next().unwrap_or_else(|| usage())),
-            "-h" | "--help" => usage(),
-            _ => address = arg,
-        }
-    }
-
-    let stream = TcpStream::connect(&address).await?;
-    stream.set_nodelay(true)?;
-    println!("connected to {address}");
-    let (reader, writer) = stream.into_split();
-
-    let tracer = Tracer::new(capture.as_deref())?;
-    let reader: Traced<_, _> =
-        Traced::new(FromTokio::new(reader), Direction::ControllerToHost, &tracer);
-    let writer: Traced<_, _> =
-        Traced::new(FromTokio::new(writer), Direction::HostToController, &tracer);
-    let transport: SerialTransport<NoopRawMutex, _, _> = SerialTransport::new(reader, writer);
-    let controller: ExternalController<_, 4> = ExternalController::new(transport);
-
-    // Command completions only arrive while something reads, so the event
-    // loop runs alongside the bring-up sequence.
-    let events = async {
-        let mut buf = [0u8; 259];
-        loop {
-            match controller.read(&mut buf).await {
-                Ok(ControllerToHostPacket::Event(event)) => println!("   event {:?}", event.kind),
-                Ok(_) => {}
-                Err(e) => return e,
-            }
-        }
-    };
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let options = Options::parse("host-h4");
+    let controller = common::connect(&options).await?;
 
     let bring_up = async {
         Reset::new().exec(&controller).await?;
@@ -134,11 +35,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
 
         let address = ReadBdAddr::new().exec(&controller).await?;
-        let bytes = address.raw();
-        println!(
-            "   BD_ADDR {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0],
-        );
+        println!("   BD_ADDR {}", addr(&address));
 
         let features = ReadLocalSupportedFeatures::new().exec(&controller).await?;
         println!(
@@ -159,9 +56,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok::<_, bt_hci::cmd::Error<_>>(())
     };
 
+    // Command completions only arrive while something reads, so the event
+    // loop runs alongside the bring-up sequence.
+    let events = common::events(&controller, |event| {
+        println!("   event {event:?}");
+        None::<()>
+    });
+
     tokio::select! {
         result = bring_up => result.map_err(|e| format!("bring-up failed: {e:?}"))?,
-        error = events => return Err(format!("controller read failed: {error:?}").into()),
+        result = events => result?,
     }
     println!("controller ready");
     Ok(())
