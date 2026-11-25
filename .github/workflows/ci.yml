@@ -44,7 +44,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Bring-up against rootcanal
+      # rootcanal gives each TCP connection its own controller, all on one
+      # virtual radio: host-h4 brings one up, then the inquiry example must
+      # find the discoverable one and read its name.
+      - name: Against rootcanal
         run: |
           sh scripts/rootcanal.sh < /dev/null > rootcanal.log 2>&1 &
           # Wait for the HCI port; a bounded probe, since a connect can hang.
@@ -52,7 +55,11 @@ jobs:
             timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/6402' 2>/dev/null && break
             sleep 1
           done
-          timeout 120 cargo run --example host-h4 -- 127.0.0.1:6402 --btsnoop host-h4.btsnoop
+          cargo build --examples
+          timeout 60 target/debug/examples/host-h4 --btsnoop host-h4.btsnoop
+          target/debug/examples/discoverable --quiet --btsnoop discoverable.btsnoop < /dev/null > discoverable.log 2>&1 &
+          sleep 3
+          timeout 60 target/debug/examples/inquiry --seconds 3 --expect bt-classic --btsnoop inquiry.btsnoop
 
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
@@ -60,6 +67,7 @@ jobs:
           name: rootcanal-trace
           path: |
             rootcanal.log
-            host-h4.btsnoop
+            *.btsnoop
+            discoverable.log
           if-no-files-found: ignore
           retention-days: 5

@@ -8,9 +8,10 @@ See [docs/design.md](docs/design.md) for the research behind it, the layout and 
 
 ## Status
 
-Milestone 0: the test harness. The crate brings up an HCI controller and traces the traffic; no protocol layers yet.
+Milestone 1: a controller comes up discoverable and connectable, with a name, Class of Device and EIR, and other devices find it. Connections, pairing, L2CAP, SDP and RFCOMM come next.
 
-- `cmd`: BR/EDR HCI commands that [bt-hci](https://github.com/embassy-rs/bt-hci) does not define yet (so far Read_Buffer_Size).
+- `gap`: the bring-up sequence (`gap::bring_up`), Class of Device, the local name, and building and parsing EIR data.
+- `cmd`: BR/EDR HCI commands that [bt-hci](https://github.com/embassy-rs/bt-hci) does not define yet: name, scan enable and activity, Class of Device, inquiry mode, EIR, Simple Pairing mode, Secure Connections host support, buffer size.
 - `trace`: wraps an H4 reader or writer, hands each HCI packet to a sink, and encodes btsnoop captures for Wireshark.
 
 ## Build
@@ -31,13 +32,15 @@ scripts/rootcanal.sh                    # Linux or macOS
 wsl --cd ~ -- sh -s < scripts/rootcanal.sh   # Windows, in WSL; the port is forwarded to localhost
 ```
 
-Then, in another terminal:
+Each TCP connection to rootcanal gets its own controller on one shared virtual radio, so several examples can see each other. In other terminals:
 
 ```sh
-cargo run --example host-h4 -- 127.0.0.1:6402 --btsnoop target/host-h4.btsnoop
+cargo run --example host-h4                      # version, address, features, buffer sizes
+cargo run --example discoverable -- --quiet      # stays discoverable until stopped
+cargo run --example inquiry -- --expect bt-classic   # finds it and reads its name
 ```
 
-It prints every packet, then the controller's version, address, features and buffer sizes. Open the `.btsnoop` file in Wireshark to decode the traffic.
+Every example prints the HCI packets it exchanges (`--quiet` turns that off) and takes `--btsnoop FILE` to write a capture that Wireshark decodes, and an optional `HOST:PORT` for a controller elsewhere.
 
 ## License
 

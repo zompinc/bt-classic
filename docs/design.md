@@ -114,7 +114,7 @@ Design rules:
 ## Milestones
 
 1. **M0 Harness (done).** `examples/host-h4.rs` brings up rootcanal over TCP (reset, version, address, features, buffer sizes); `trace::Traced` prints every H4 packet and writes a btsnoop capture; `scripts/rootcanal.sh` runs rootcanal (in WSL on Windows); CI runs fmt, clippy, unit tests, a bare-metal `no_std` build and the bring-up against rootcanal.
-1. **M1 Discoverable.** Bring-up sequence and the missing bt-hci commands; the device shows up on an Android phone (emulator first, then a real phone) with the right name and class.
+1. **M1 Discoverable (done on rootcanal).** `gap::bring_up` and the missing bt-hci commands. The `discoverable` example is found by the `inquiry` example, which also reads its name with a Remote Name Request, and independently by Python Bumble 0.0.236, which decodes the same name, class 0x200404, HSP and Android Auto UUIDs from the EIR. CI runs the inquiry check. Still to see: a real Android phone, once there is a radio (the ESP32 or a USB dongle).
 1. **M2 Pairing.** Accept ACL, SSP with NoInputNoOutput (Just Works) and DisplayYesNo, link key storage, bonded reconnect, encryption on.
 1. **M3 L2CAP and SDP.** Signaling, basic-mode channels, an SDP server holding the Android Auto and HSP HS records; verified with Bumble's SDP client and an Android phone.
 1. **M4 RFCOMM.** A server channel (8) that an Android app or Bumble's RFCOMM client can open, with data echoed both ways; then the aa-dongle handshake running over it on the PC.
