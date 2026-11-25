@@ -8,9 +8,11 @@ See [docs/design.md](docs/design.md) for the research behind it, the layout and 
 
 ## Status
 
-Milestone 2: a controller comes up discoverable and connectable, accepts connections, pairs with Secure Simple Pairing (Just Works or numeric comparison), stores link keys and reconnects bonded devices without pairing again. L2CAP, SDP and RFCOMM come next.
+Milestone 3: a controller comes up discoverable and connectable, accepts connections, pairs with Secure Simple Pairing (Just Works or numeric comparison), stores link keys, reconnects bonded devices without pairing again, and answers SDP queries over L2CAP. RFCOMM comes next.
 
-- `host`: the async runner (`host::run`) that reads the controller, drives pairing and sends the replies, with a `Handler` for progress and numeric-comparison prompts.
+- `host`: the async runner (`host::run`) that brings the controller up, reads it, drives pairing, L2CAP and SDP, and sends their replies, with a `Handler` for progress and numeric-comparison prompts.
+- `l2cap`: basic-mode L2CAP with no I/O: signaling, channels the peer opens, MTU configuration, reassembly.
+- `sdp`: an SDP server for static service records, with continuation; `rfcomm_service_record!` builds the usual RFCOMM record.
 - `security`: the pairing state machine, with no I/O, and the `LinkKeyStore` trait (`MemoryKeyStore` keeps keys in RAM).
 - `gap`: the bring-up sequence (`gap::bring_up`), Class of Device, the local name, and building and parsing EIR data.
 - `cmd`: BR/EDR HCI commands that [bt-hci](https://github.com/embassy-rs/bt-hci) does not define yet: PIN code negative reply, name, scan enable and activity, Class of Device, inquiry mode, EIR, Simple Pairing mode, Secure Connections host support, buffer size.
@@ -42,6 +44,8 @@ cargo run --example discoverable -- --quiet --keys target/keys.txt   # accepts a
 cargo run --example inquiry -- --expect bt-classic   # finds it and reads its name
 cargo run --example pair -- --expect bt-classic      # pairs, then reconnects on the bond
 ```
+
+`tests/peer/sdp_check.py` reads the `discoverable` example's SDP records with Google's [Bumble](https://github.com/google/bumble) as an independent client (`pip install bumble==0.0.236`, then `python tests/peer/sdp_check.py`).
 
 Every example prints the HCI packets it exchanges (`--quiet` turns that off) and takes `--btsnoop FILE` to write a capture that Wireshark decodes, and an optional `HOST:PORT` for a controller elsewhere.
 
