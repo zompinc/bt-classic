@@ -54,6 +54,11 @@ Evidence it works on real hardware: [niart120/swbt-bumble-backend](https://githu
 
 **Recommendation: depend on bt-hci.** Define the missing commands locally with `cmd!` from day one, and upstream them as one PR (closing #82) once they have been exercised against a real controller. This also keeps the door open to running TrouBLE and bt-classic on one dual-mode controller later; that needs a shared event dispatcher, which is a later design question, not a milestone-1 one.
 
+Found while building M0:
+
+- **`cmd!` is usable from outside, with a catch.** It is `#[doc(hidden)]` but exported, and `src/cmd.rs` defines Read_Buffer_Size with it. Its expansion names `::bt_hci_transport::PacketToController` by absolute path instead of through `$crate`, so any crate using it must depend on `bt-hci-transport` directly. Worth a one-line upstream fix.
+- **`ExternalController` reads into a fixed 259-byte buffer** (`type Buffer<'a> = [u8; 259]`), sized for LE. BR/EDR controllers report much larger ACL packets: rootcanal reports 10 x 1023 bytes, and DH5 packets carry up to 1021. The H4 transport would fail an oversized ACL packet with `BufferTooSmall`. Before M3 we either ask the controller to fragment to our size with Host_Buffer_Size (honoured only with host flow control on some controllers), write our own `Controller` over the same transport, or propose a const-generic buffer upstream.
+
 ### 3. Classic on the ESP32 through esp-radio
 
 esp-radio 1.0.0-beta.1 (`src/ble/btdm.rs`, `src/ble/os_adapter_esp32.rs`) hard-codes BLE in three places: `create_ble_config` sets `mode: ESP_BT_MODE_BLE` and `bt_max_acl_conn: 0`, and `ble_init` calls `btdm_controller_enable(ESP_BT_MODE_BLE)`. The VHCI connector (`BleConnector`, a bt-hci `Transport`) forwards raw H4 frames, so classic traffic would pass through it unchanged once the controller is in BTDM mode.
@@ -108,7 +113,7 @@ Design rules:
 
 ## Milestones
 
-1. **M0 Harness.** PC example talking HCI over TCP to rootcanal; HCI tracing; CI running unit tests on the host.
+1. **M0 Harness (done).** `examples/host-h4.rs` brings up rootcanal over TCP (reset, version, address, features, buffer sizes); `trace::Traced` prints every H4 packet and writes a btsnoop capture; `scripts/rootcanal.sh` runs rootcanal (in WSL on Windows); CI runs fmt, clippy, unit tests, a bare-metal `no_std` build and the bring-up against rootcanal.
 1. **M1 Discoverable.** Bring-up sequence and the missing bt-hci commands; the device shows up on an Android phone (emulator first, then a real phone) with the right name and class.
 1. **M2 Pairing.** Accept ACL, SSP with NoInputNoOutput (Just Works) and DisplayYesNo, link key storage, bonded reconnect, encryption on.
 1. **M3 L2CAP and SDP.** Signaling, basic-mode channels, an SDP server holding the Android Auto and HSP HS records; verified with Bumble's SDP client and an Android phone.
