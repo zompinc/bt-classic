@@ -1,6 +1,6 @@
 //! Brings a controller up as a discoverable, connectable classic device that
-//! accepts connections, pairs (Just Works) and answers SDP queries, and
-//! prints what happens until stopped.
+//! accepts connections, pairs (Just Works), answers SDP queries and echoes
+//! RFCOMM data, and prints what happens until stopped.
 //!
 //! ```sh
 //! cargo run --example discoverable -- --name bt-classic --keys target/discoverable-keys.txt
@@ -8,8 +8,9 @@
 //!
 //! It advertises and serves the records the dongle needs: the wireless
 //! Android Auto service on RFCOMM channel 8 and an HSP headset on channel 6.
-//! Nothing listens on RFCOMM yet. With `--keys FILE`, link keys are kept in
-//! that file, so bonded devices reconnect without pairing after a restart.
+//! Both RFCOMM channels echo what they receive. With `--keys FILE`, link
+//! keys are kept in that file, so bonded devices reconnect without pairing
+//! after a restart.
 
 mod common;
 
@@ -69,8 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Progress is printed by the console; nothing here waits for it.
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut console = Console { tx };
+    let mut console = Console { tx, echo: true };
     let mut stack = Stack::new(SecurityConfig::default(), &RECORDS, keys);
+    stack.rfcomm.register(8);
+    stack.rfcomm.register(6);
     let error = host::run(&hci, &mut stack, &config, &mut console).await;
     Err(format!("controller failed: {error:?}").into())
 }

@@ -16,3 +16,4 @@ pub mod rfcomm;
 pub mod sdp;
 pub mod security;
 pub mod trace;
+pub mod transport;

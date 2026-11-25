@@ -28,6 +28,7 @@ use embassy_sync::signal::Signal;
 use crate::cmd::PinCodeRequestNegativeReply;
 use crate::gap::{self, ClassicController, ControllerInfo};
 use crate::l2cap::{self, ChannelEvent, L2cap};
+use crate::rfcomm::{self, Dlc, Rfcomm, RfcommEvent, SendError};
 use crate::sdp::{self, SdpServer, ServiceRecord};
 use crate::security::{Action, ConfirmRequest, LinkKeyStore, Notice, Security, SecurityConfig};
 
@@ -59,6 +60,21 @@ pub trait Handler {
         let _ = (channel, data);
     }
 
+    /// A peer opened RFCOMM channel `dlc`; `tx` can send on it right away.
+    fn rfcomm_opened(&mut self, dlc: Dlc, tx: &mut RfcommTx<'_>) {
+        let _ = (dlc, tx);
+    }
+
+    /// Data arrived on RFCOMM channel `dlc`.
+    fn rfcomm_data(&mut self, dlc: Dlc, data: &[u8], tx: &mut RfcommTx<'_>) {
+        let _ = (dlc, data, tx);
+    }
+
+    /// RFCOMM channel `dlc` closed.
+    fn rfcomm_closed(&mut self, dlc: Dlc) {
+        let _ = dlc;
+    }
+
     /// Numeric comparison: return whether the user confirmed that both
     /// devices show `request.numeric_value`. Only asked when both sides can
     /// display and answer; the default accepts.
@@ -81,6 +97,24 @@ pub trait Handler {
     }
 }
 
+/// Sends on RFCOMM channels from inside [`Handler`] callbacks. Data is
+/// buffered per channel and goes out as the peer's credits allow.
+pub struct RfcommTx<'a> {
+    rfcomm: &'a mut Rfcomm,
+}
+
+impl RfcommTx<'_> {
+    /// Queues `data` on `dlc`, all or nothing.
+    pub fn send(&mut self, dlc: Dlc, data: &[u8]) -> Result<(), SendError> {
+        self.rfcomm.send(dlc, data)
+    }
+
+    /// Bytes `dlc` can still buffer.
+    pub fn room(&self, dlc: Dlc) -> usize {
+        self.rfcomm.room(dlc)
+    }
+}
+
 /// A [`Handler`] that ignores everything and accepts every confirmation.
 pub struct NoHandler;
 
@@ -92,6 +126,8 @@ pub struct Stack<'r, S> {
     pub security: Security,
     pub l2cap: L2cap,
     pub sdp: SdpServer<'r>,
+    /// Register server channels with `stack.rfcomm.register(channel)`.
+    pub rfcomm: Rfcomm,
     pub keys: S,
 }
 
@@ -101,10 +137,12 @@ impl<'r, S: LinkKeyStore> Stack<'r, S> {
     pub fn new(security: SecurityConfig, records: &'r [ServiceRecord<'r>], keys: S) -> Self {
         let mut l2cap = L2cap::new();
         l2cap.register(sdp::PSM);
+        l2cap.register(rfcomm::PSM);
         Self {
             security: Security::new(security),
             l2cap,
             sdp: SdpServer::new(records),
+            rfcomm: Rfcomm::new(),
             keys,
         }
     }
@@ -150,8 +188,10 @@ enum Packet {
     },
 }
 
-/// How many packets can wait between the reader and the handler.
-const QUEUE: usize = 8;
+/// How many packets can wait between the reader and the handler. RFCOMM
+/// gives each peer [`rfcomm::RX_CREDITS`] frames in flight, each up to three
+/// ACL packets, and events come on top.
+const QUEUE: usize = 16;
 
 /// ACL buffers in the controller: packets may only be sent while some are
 /// free. Completed_Packets events return them; a disconnection returns that
@@ -359,6 +399,15 @@ where
                             if n > 0 {
                                 let _ = stack.l2cap.send(channel.local_cid, &response[..n]);
                             }
+                        } else if channel.psm == rfcomm::PSM {
+                            if let Some(got) =
+                                stack.rfcomm.on_data(channel.local_cid, received.data)
+                            {
+                                let mut tx = RfcommTx {
+                                    rfcomm: &mut stack.rfcomm,
+                                };
+                                handler.rfcomm_data(got.dlc, got.data, &mut tx);
+                            }
                         } else {
                             handler.data(&channel, received.data);
                         }
@@ -367,13 +416,48 @@ where
             }
 
             while let Some(event) = stack.l2cap.pop_event() {
+                match event {
+                    ChannelEvent::Opened(c) if c.psm == rfcomm::PSM => {
+                        stack.rfcomm.l2cap_opened(c.local_cid, c.remote_mtu);
+                    }
+                    ChannelEvent::Closed(c) if c.psm == rfcomm::PSM => {
+                        stack.rfcomm.l2cap_closed(c.local_cid);
+                    }
+                    _ => {}
+                }
                 handler.channel(event);
             }
-            while let Some(pdu) = stack.l2cap.pop_outbound() {
-                if let Err(e) =
-                    send_pdu(controller, &credits, pdu.handle, pdu.as_bytes(), acl_len).await
+            while let Some(event) = stack.rfcomm.pop_event() {
+                match event {
+                    RfcommEvent::Opened(dlc) => {
+                        let mut tx = RfcommTx {
+                            rfcomm: &mut stack.rfcomm,
+                        };
+                        handler.rfcomm_opened(dlc, &mut tx);
+                    }
+                    RfcommEvent::Closed(dlc) => handler.rfcomm_closed(dlc),
+                }
+            }
+
+            // RFCOMM frames become L2CAP PDUs as the outbox has room, and
+            // PDUs become ACL packets as the controller has buffers.
+            loop {
+                while stack.l2cap.outbox_room() > 0
+                    && let Some(frame) = stack.rfcomm.pop_outbound()
                 {
-                    return Error::Io(e);
+                    let _ = stack.l2cap.send(frame.l2cap_cid, frame.as_bytes());
+                }
+                let mut sent = false;
+                while let Some(pdu) = stack.l2cap.pop_outbound() {
+                    sent = true;
+                    if let Err(e) =
+                        send_pdu(controller, &credits, pdu.handle, pdu.as_bytes(), acl_len).await
+                    {
+                        return Error::Io(e);
+                    }
+                }
+                if !sent {
+                    break;
                 }
             }
         }

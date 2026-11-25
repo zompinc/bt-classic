@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 use bt_classic::gap;
 use bt_classic::gap::ControllerInfo;
-use bt_classic::host::Handler;
+use bt_classic::host::{Handler, RfcommTx};
 use bt_classic::l2cap::ChannelEvent;
+use bt_classic::rfcomm::Dlc;
 use bt_classic::security::{
     Action, ConfirmRequest, LinkKeyStore, MemoryKeyStore, Notice, StoredKey,
 };
@@ -112,9 +113,11 @@ pub enum Progress {
     InquiryComplete,
 }
 
-/// Prints notices and forwards them, with inquiry results, to `tx`.
+/// Prints notices and forwards them, with inquiry results, to `tx`. With
+/// `echo`, sends RFCOMM data straight back.
 pub struct Console {
     pub tx: UnboundedSender<Progress>,
+    pub echo: bool,
 }
 
 impl Handler for Console {
@@ -137,6 +140,27 @@ impl Handler for Console {
             "   L2CAP channel {what}: PSM 0x{:04x}, local 0x{:04x}, remote 0x{:04x}, peer MTU {}",
             channel.psm, channel.local_cid, channel.remote_cid, channel.remote_mtu
         );
+    }
+
+    fn rfcomm_opened(&mut self, dlc: Dlc, _tx: &mut RfcommTx<'_>) {
+        println!("   RFCOMM channel {} opened", dlc.channel());
+    }
+
+    fn rfcomm_data(&mut self, dlc: Dlc, data: &[u8], tx: &mut RfcommTx<'_>) {
+        println!(
+            "   RFCOMM channel {}: {} byte(s)",
+            dlc.channel(),
+            data.len()
+        );
+        if self.echo
+            && let Err(e) = tx.send(dlc, data)
+        {
+            println!("   echo dropped: {e:?}");
+        }
+    }
+
+    fn rfcomm_closed(&mut self, dlc: Dlc) {
+        println!("   RFCOMM channel {} closed", dlc.channel());
     }
 
     fn event(&mut self, event: &Event<'_>) {

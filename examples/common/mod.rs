@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bt_classic::trace::{Direction, Sink, Traced, btsnoop};
+use bt_classic::transport::SplitAcl;
 use bt_hci::ControllerToHostPacket;
 use bt_hci::controller::{Controller, ExternalController};
 use bt_hci::event::Event;
@@ -24,8 +25,9 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 type Reader = Traced<'static, FromTokio<OwnedReadHalf>, Tracer>;
 type Writer = Traced<'static, FromTokio<OwnedWriteHalf>, Tracer>;
 
-/// A controller reached over TCP, with every packet traced.
-pub type Hci = ExternalController<SerialTransport<NoopRawMutex, Reader, Writer>, 4>;
+/// A controller reached over TCP, with every packet traced, and ACL packets
+/// split to fit bt-hci's read buffer.
+pub type Hci = ExternalController<SplitAcl<SerialTransport<NoopRawMutex, Reader, Writer>>, 4>;
 
 /// Options every example takes; the rest are left in `rest`.
 pub struct Options {
@@ -145,8 +147,8 @@ pub async fn connect(options: &Options) -> std::io::Result<Hci> {
     )?));
     let reader = Traced::new(FromTokio::new(reader), Direction::ControllerToHost, tracer);
     let writer = Traced::new(FromTokio::new(writer), Direction::HostToController, tracer);
-    Ok(ExternalController::new(SerialTransport::new(
-        reader, writer,
+    Ok(ExternalController::new(SplitAcl::new(
+        SerialTransport::new(reader, writer),
     )))
 }
 
