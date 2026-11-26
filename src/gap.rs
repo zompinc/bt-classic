@@ -360,11 +360,17 @@ pub async fn bring_up<C: ClassicController>(
 ) -> Result<ControllerInfo, Error<C::Error>> {
     controller.exec(&Reset::new()).await?;
     // Without host flow control the counts are unused, but the controller
-    // must still split ACL data to this length (Core v5.4, Vol 4, Part E,
-    // 7.3.39).
-    controller
+    // should still split ACL data to this length (Core v5.4, Vol 4, Part E,
+    // 7.3.39). Only a hint: rootcanal ignores it and the ESP32 controller
+    // rejects it as unsupported, so a refusal is not fatal. Larger packets
+    // are split on the host side by `transport::SplitAcl`.
+    match controller
         .exec(&HostBufferSize::new(HOST_ACL_DATA_PACKET_LENGTH, 64, 8, 1))
-        .await?;
+        .await
+    {
+        Ok(()) | Err(Error::Hci(_)) => {}
+        Err(e) => return Err(e),
+    }
     controller
         .exec(&SetEventMask::new(classic_event_mask()))
         .await?;
