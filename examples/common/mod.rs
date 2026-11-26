@@ -1,5 +1,5 @@
-//! What the PC examples share: arguments, connecting to an H4-over-TCP
-//! controller with tracing, and reading events.
+//! What the PC examples share: arguments, connecting to an H4 controller
+//! over TCP or a serial port with tracing, and reading events.
 
 #![allow(dead_code)] // Not every example uses every helper.
 
@@ -19,19 +19,26 @@ use bt_hci::param::BdAddr;
 use bt_hci_serial::SerialTransport;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embedded_io_adapters::tokio_1::FromTokio;
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio_serial::{FlowControl, SerialPortBuilderExt};
 
-type Reader = Traced<'static, FromTokio<OwnedReadHalf>, Tracer>;
-type Writer = Traced<'static, FromTokio<OwnedWriteHalf>, Tracer>;
+/// A TCP connection or a serial port.
+pub trait Link: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Link for T {}
 
-/// A controller reached over TCP, with every packet traced, and ACL packets
-/// split to fit bt-hci's read buffer.
+type Reader = Traced<'static, FromTokio<ReadHalf<Box<dyn Link>>>, Tracer>;
+type Writer = Traced<'static, FromTokio<WriteHalf<Box<dyn Link>>>, Tracer>;
+
+/// A controller reached over TCP or a serial port, with every packet traced,
+/// and ACL packets split to fit bt-hci's read buffer.
 pub type Hci = ExternalController<SplitAcl<SerialTransport<NoopRawMutex, Reader, Writer>>, 4>;
 
 /// Options every example takes; the rest are left in `rest`.
 pub struct Options {
-    /// `HOST:PORT` of the controller, rootcanal's HCI port by default.
+    /// `HOST:PORT` of the controller, rootcanal's HCI port by default, or
+    /// `serial:PORT[@BAUD]` for an H4 UART controller (921600 baud and
+    /// RTS/CTS flow control by default, as ESP-IDF's HCI UART example uses).
     pub address: String,
     /// `--btsnoop FILE`: also write a capture.
     pub btsnoop: Option<String>,
@@ -76,7 +83,7 @@ impl Options {
 
 pub fn exit_usage(usage: &str) -> ! {
     eprintln!("usage: {usage}");
-    eprintln!("common options: [HOST:PORT] [--btsnoop FILE] [--quiet]");
+    eprintln!("common options: [HOST:PORT | serial:PORT[@BAUD]] [--btsnoop FILE] [--quiet]");
     std::process::exit(2);
 }
 
@@ -135,10 +142,26 @@ impl Sink for Tracer {
 
 /// Connects to the controller at `options.address`.
 pub async fn connect(options: &Options) -> std::io::Result<Hci> {
-    let stream = TcpStream::connect(&options.address).await?;
-    stream.set_nodelay(true)?;
-    println!("connected to {}", options.address);
-    let (reader, writer) = stream.into_split();
+    let link: Box<dyn Link> = match options.address.strip_prefix("serial:") {
+        Some(port) => {
+            let (port, baud) = match port.split_once('@') {
+                Some((port, baud)) => (port, baud.parse().map_err(std::io::Error::other)?),
+                None => (port, 921_600),
+            };
+            let serial = tokio_serial::new(port, baud)
+                .flow_control(FlowControl::Hardware)
+                .open_native_async()?;
+            println!("opened {port} at {baud} baud");
+            Box::new(serial)
+        }
+        None => {
+            let stream = TcpStream::connect(&options.address).await?;
+            stream.set_nodelay(true)?;
+            println!("connected to {}", options.address);
+            Box::new(stream)
+        }
+    };
+    let (reader, writer) = tokio::io::split(link);
 
     // The examples run until they exit, so the tracer can live forever.
     let tracer: &'static Tracer = Box::leak(Box::new(Tracer::new(
