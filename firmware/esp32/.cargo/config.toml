@@ -1,0 +1,15 @@
+[build]
+target = "xtensa-esp32-none-elf"
+
+[target.xtensa-esp32-none-elf]
+runner    = "espflash flash --monitor"
+rustflags = ["-C", "link-arg=-Wl,-Tlinkall.x", "-C", "link-arg=-nostartfiles"]
+
+[env]
+# Not "info": esp-log writes each line to the UART with interrupts masked
+# (about 10 ms per line at 115200 baud), and a log line while a BR/EDR link
+# comes up starves the controller until the link times out.
+ESP_LOG = "warn"
+
+[unstable]
+build-std = ["core", "alloc"]
