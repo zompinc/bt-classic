@@ -1,6 +1,6 @@
 # bt-classic design
 
-Status: M0-M4 done on rootcanal (see Milestones); M5 (ESP32) next. Written 2026-11-25 as research and proposal.
+Status: M0-M4 done on rootcanal and checked with a real phone through the ESP32 controller over UART (see Milestones); the esp-radio part of M5 next. Written 2026-11-25 as research and proposal.
 
 ## Goal
 
@@ -57,7 +57,7 @@ Evidence it works on real hardware: [niart120/swbt-bumble-backend](https://githu
 Found while building M0:
 
 - **`cmd!` is usable from outside, with a catch.** It is `#[doc(hidden)]` but exported, and `src/cmd.rs` defines Read_Buffer_Size with it. Its expansion names `::bt_hci_transport::PacketToController` by absolute path instead of through `$crate`, so any crate using it must depend on `bt-hci-transport` directly. Worth a one-line upstream fix.
-- **`ExternalController` reads into a fixed 259-byte buffer** (`type Buffer<'a> = [u8; 259]`), sized for LE, while BR/EDR controllers deliver much larger ACL packets (rootcanal: 10 x 1023 bytes; DH5 carries up to 1021). M3 sent Host_Buffer_Size with 255 bytes, which the spec says the controller must split to (Core v5.4, Vol 4, Part E, 7.3.39), but M4 showed rootcanal ignores it without host flow control: a 300-byte RFCOMM frame failed the read with `BufferTooSmall` (M3's SDP packets were all small, so it went unnoticed). The fix that does not depend on the controller is `transport::SplitAcl`: it wraps any bt-hci transport, reads into its own 1028-byte buffer and hands oversized ACL packets up as 255-byte pieces with continuation flags, which L2CAP reassembles. Host_Buffer_Size stays as a hint. Upstream, a const-generic read buffer in `ExternalController` would make the adapter unnecessary.
+- **`ExternalController` reads into a fixed 259-byte buffer** (`type Buffer<'a> = [u8; 259]`), sized for LE, while BR/EDR controllers deliver much larger ACL packets (rootcanal: 10 x 1023 bytes; DH5 carries up to 1021). M3 sent Host_Buffer_Size with 255 bytes, which the spec says the controller must split to (Core v5.4, Vol 4, Part E, 7.3.39), but M4 showed rootcanal ignores it without host flow control: a 300-byte RFCOMM frame failed the read with `BufferTooSmall` (M3's SDP packets were all small, so it went unnoticed). The fix that does not depend on the controller is `transport::SplitAcl`: it wraps any bt-hci transport, reads into its own 1028-byte buffer and hands oversized ACL packets up as 255-byte pieces with continuation flags, which L2CAP reassembles. Host_Buffer_Size stays as a hint, and bring-up carries on when a controller rejects it, as the ESP32's does (Unsupported Feature, 0x11). Upstream, a const-generic read buffer in `ExternalController` would make the adapter unnecessary.
 
 ### 3. Classic on the ESP32 through esp-radio
 
@@ -118,12 +118,16 @@ Design rules:
 1. **M2 Pairing (done on rootcanal).** `security::Security` (no I/O) and `host::run`. The `discoverable` example accepts, pairs with Just Works SSP, encrypts, keeps keys in a file and reconnects bonded peers without pairing, also after a restart; the `pair` example plays the phone and CI runs it. With Secure Connections on, keys are P-256 (type 7). Python Bumble 0.0.236 as the phone, with its defaults (DisplayYesNo, MITM requested, like a phone), pairs and stores the same key and type, and reconnects on the bond. rootcanal hands out a fixed dummy key, so real key exchange is still to be seen with a phone.
 1. **M3 L2CAP and SDP (done on rootcanal).** `l2cap::L2cap` (no I/O): signaling, peer-opened basic-mode channels, MTU configuration, information and echo requests, reassembly. `sdp::SdpServer` with static records (`rfcomm_service_record!`) and continuation. `host::run` now brings the controller up itself, sends ACL data on the controller's buffer credits, and serves SDP on PSM 1. The `discoverable` example serves the AA Wireless (RFCOMM 8) and HSP headset (RFCOMM 6) records; Python Bumble 0.0.236 reads them in CI (`tests/peer/sdp_check.py`), once with its default MTU and once with the 48-byte minimum, which splits the answers with continuation state.
 1. **M4 RFCOMM (done on rootcanal).** `rfcomm::Rfcomm` (no I/O): the multiplexer, PN, credit-based flow control, MSC, and RPN, RLS and Test answered, NSC for the rest. `host::run` runs it on PSM 3 and gives the `Handler` RFCOMM callbacks with a sender, so an application can reply or speak first. The `discoverable` example echoes on channels 8 and 6. Python Bumble 0.0.236 plays the phone in CI (`tests/peer/rfcomm_check.py`): it pairs and encrypts, finds channel 8 via SDP, and gets 5, 300, 1000 and 5000-byte payloads echoed intact; channel 6 echoes and an unregistered channel is refused. The aa-dongle handshake runs on top in aa-dongle itself (it depends on aa-core, which this public crate should not), as the first step of M5.
-1. **M5 ESP32.** esp-radio patch for BTDM mode (local first, upstream PR to esp-rs/esp-hal after); the stack on the DevKitC, link keys in flash, aa-dongle integration with Wi-Fi coexistence.
+1. **M5 ESP32.** First, the host stack on the PC against the real ESP32 controller (done 2026-11-26): ESP-IDF v6.1.1's `controller_hci_uart_esp32` on a DevKitC (ESP32-D0WD-V3), H4 over a 3.3 V FTDI cable at 921600 baud with RTS/CTS, `serial:PORT` in the examples. The controller reports Bluetooth 4.2 with BR/EDR, SSP and LE, 9 x 1021-byte ACL buffers, and refuses Host_Buffer_Size. An Android phone pairs with the `discoverable` example, encrypts, reads SDP and opens RFCOMM channels 6 and 8; aa-dongle's `bt-dongle` runs the full wireless AA handshake with it, and the phone then joins the S3's access point and opens TCP 5288 to its relay. Then: esp-radio patch for BTDM mode (local first, upstream PR to esp-rs/esp-hal after); the stack on the DevKitC, link keys in flash, aa-dongle integration with Wi-Fi coexistence.
 1. **M6 Upstream.** bt-hci PR with the BR/EDR commands (closes embassy-rs/bt-hci#82); possibly reach out to pulzar-net/bluetooth-host, which plans classic support.
 
 ## Open questions
 
-- Which IO capability does the AA handshake need? Commercial AA dongles pair Just Works; confirm the phone does not insist on numeric comparison.
-- Whether the phone needs the HSP record only in SDP or an actual HSP RFCOMM connection to proceed. aa-dongle's BlueZ code accepts the HSP connection and does nothing with it.
-- Whether Secure Connections (P-256) on the ESP32 controller works through VHCI; Simple Pairing with P-192 is the fallback.
+- Whether Secure Connections (P-256) works through VHCI. It works with the same controller over UART: the phone's key is type 7 (unauthenticated P-256). Simple Pairing with P-192 stays the fallback.
 - Publishing to crates.io: not yet; the crate stays `publish = false` until there is something to use.
+
+Answered with one Android phone on the ESP32 controller (2026-11-26):
+
+- IO capability: Just Works is enough. The phone offers DisplayYesNo and asks for MITM protection with dedicated bonding, but accepts the unauthenticated key that NoInputNoOutput produces.
+- HSP: the phone opens a real RFCOMM connection on the headset channel (6) and keeps it open, before it opens Android Auto's channel (8).
+- The handshake: Android Auto opens channel 8 right after pairing and waits for the dongle to speak. With an unreachable network it reports an 11-byte `WifiConnectStatus` and retries the whole handshake over and over; once it can join, the status is 2 bytes and it stops.

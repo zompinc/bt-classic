@@ -51,6 +51,17 @@ cargo run --example pair -- --expect bt-classic      # pairs, then reconnects on
 
 Every example prints the HCI packets it exchanges (`--quiet` turns that off) and takes `--btsnoop FILE` to write a capture that Wireshark decodes, and an optional `HOST:PORT` for a controller elsewhere.
 
+## Run against a real ESP32 controller
+
+ESP-IDF's HCI UART example (`examples/bluetooth/hci/controller_hci_uart_esp32` in v6.1.1) turns an ESP32 into a dual-mode controller that speaks H4 on UART1: TX GPIO5, RX GPIO18, RTS GPIO19, CTS GPIO23, 921600 baud with hardware flow control. Wire a 3.3 V USB-UART adapter crosswise (ESP32 TX to adapter RX, RTS to CTS, and back, plus GND) and pass its port as `serial:PORT[@BAUD]`:
+
+```sh
+cargo run --example host-h4 -- serial:COM10
+cargo run --example discoverable -- serial:/dev/ttyUSB0 --quiet --keys target/keys.txt
+```
+
+The `discoverable` example then pairs with a real phone.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
