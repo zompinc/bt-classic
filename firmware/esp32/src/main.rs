@@ -3,9 +3,10 @@
 //! (Just Works), serves the Android Auto (RFCOMM 8) and HSP headset (RFCOMM
 //! 6) records and echoes RFCOMM data, like the PC `discoverable` example.
 //!
-//! esp-radio runs the ESP32 controller BLE-only; this needs its
-//! `bredr_max_connections` option (dual mode), which is not upstream yet.
-//! Link keys live in RAM, so a reset forgets bonds.
+//! esp-radio's default controller configuration already handles BR/EDR on
+//! the ESP32. What it needs is short interrupt latency: see the `ESP_LOG`
+//! note in `.cargo/config.toml`. Link keys live in RAM, so a reset forgets
+//! bonds.
 
 #![no_std]
 #![no_main]
@@ -104,7 +105,7 @@ async fn main(_spawner: Spawner) {
 
     let connector = BleConnector::new(
         peripherals.BT,
-        esp_radio::ble::Config::default().with_bredr_max_connections(1),
+        esp_radio::ble::Config::default(),
     )
     .unwrap();
     // A BR/EDR ACL packet is up to 1021 bytes plus headers.
