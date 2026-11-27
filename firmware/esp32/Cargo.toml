@@ -1,0 +1,31 @@
+[package]
+name         = "bt-classic-esp32"
+version      = "0.0.0"
+edition      = "2024"
+license      = "MIT OR Apache-2.0"
+description  = "bt-classic on an original ESP32 through esp-radio: discoverable, pairs, serves SDP and echoes RFCOMM"
+publish      = false
+
+# Not part of the root package's build: it needs the Xtensa toolchain.
+[workspace]
+
+[dependencies]
+bt-classic             = { path = "../..", features = ["log"] }
+bt-hci                 = { version = "0.11", default-features = false }
+embassy-executor       = "0.10.0"
+embassy-futures        = "0.1"
+embassy-time           = "0.5"
+esp-alloc              = { git = "https://github.com/esp-rs/esp-hal", rev = "efc28aa2", features = ["esp32"] }
+esp-backtrace          = { git = "https://github.com/esp-rs/esp-hal", rev = "efc28aa2", features = ["esp32", "panic-handler", "log-04"] }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", rev = "efc28aa2", features = ["esp32"] }
+esp-hal                = { git = "https://github.com/esp-rs/esp-hal", rev = "efc28aa2", features = ["esp32", "log-04", "unstable"] }
+esp-log                = { git = "https://github.com/esp-rs/esp-hal", rev = "efc28aa2", features = ["esp32", "log-04"] }
+esp-radio              = { git = "https://github.com/esp-rs/esp-hal", rev = "efc28aa2", features = ["esp32", "ble", "log-04", "unstable"] }
+esp-rtos               = { git = "https://github.com/esp-rs/esp-hal", rev = "efc28aa2", features = ["esp32", "esp-radio", "embassy", "log-04"] }
+log                    = "0.4"
+
+[profile.release]
+debug         = true
+opt-level     = "s"
+codegen-units = 1
+lto           = "fat"
