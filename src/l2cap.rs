@@ -1,6 +1,6 @@
-//! L2CAP for BR/EDR in basic mode (Core v5.4, Vol 3, Part A), as the
-//! accepting side: the signaling channel, dynamic channels opened by the
-//! peer, and reassembly of ACL fragments.
+//! L2CAP for BR/EDR in basic mode (Core v5.4, Vol 3, Part A): the
+//! signaling channel, dynamic channels opened by either side, and
+//! reassembly of ACL fragments.
 //!
 //! Like [`crate::security`], it does no I/O. Feed it ACL packets with
 //! [`L2cap::on_acl`]; it hands back data that arrived on open channels and
@@ -8,7 +8,7 @@
 //! complete L2CAP PDUs. Splitting those into controller-sized ACL packets is
 //! the runner's job, since it knows the controller's buffers.
 //!
-//! Not supported: opening channels ourselves, ERTM and streaming modes,
+//! Not supported: ERTM and streaming modes,
 //! connectionless data, and per-PSM security requirements.
 
 use bt_hci::data::AclPacketBoundary;
@@ -61,6 +61,7 @@ mod reject {
 
 mod connection {
     pub const SUCCESS: u16 = 0x0000;
+    pub const PENDING: u16 = 0x0001;
     pub const PSM_NOT_SUPPORTED: u16 = 0x0002;
     pub const NO_RESOURCES: u16 = 0x0004;
 }
@@ -103,11 +104,14 @@ pub struct Channel {
     pub remote_cid: u16,
     /// The largest SDU the peer accepts.
     pub remote_mtu: u16,
+    /// We opened it with [`L2cap::connect`].
+    pub outgoing: bool,
     /// Our configuration request was accepted.
     ours_done: bool,
     /// We accepted the peer's configuration request.
     theirs_done: bool,
-    /// Identifier of our outstanding configuration request.
+    /// Identifier of our outstanding connection request while `remote_cid`
+    /// is 0, then of our outstanding configuration request.
     config_ident: u8,
 }
 
@@ -124,6 +128,8 @@ impl Channel {
 pub enum ChannelEvent {
     Opened(Channel),
     Closed(Channel),
+    /// A channel we asked for with [`L2cap::connect`] was refused.
+    Failed(Channel),
 }
 
 /// Data that arrived on an open channel.
@@ -354,6 +360,66 @@ impl L2cap {
         Ok(())
     }
 
+    /// Opens a channel to `psm` on the link `handle`. Returns our CID, or
+    /// `None` if there is no such link or no room. [`ChannelEvent::Opened`]
+    /// follows once both sides are configured, [`ChannelEvent::Failed`] if
+    /// the peer refuses.
+    pub fn connect(&mut self, handle: ConnHandle, psm: u16) -> Option<u16> {
+        if !self.links.iter().flatten().any(|l| l.handle == handle) || self.outbox_room() == 0 {
+            return None;
+        }
+        let slot = self.channels.iter().position(Option::is_none)?;
+        let local_cid = self.allocate_cid();
+        let ident = self.ident();
+        self.channels[slot] = Some(Channel {
+            handle,
+            psm,
+            local_cid,
+            remote_cid: 0,
+            remote_mtu: MTU,
+            outgoing: true,
+            ours_done: false,
+            theirs_done: false,
+            config_ident: ident,
+        });
+        let (p, c) = (psm.to_le_bytes(), local_cid.to_le_bytes());
+        self.signal(
+            handle,
+            code::CONNECTION_REQUEST,
+            ident,
+            &[p[0], p[1], c[0], c[1]],
+        );
+        Some(local_cid)
+    }
+
+    /// Closes the channel `local_cid`. [`ChannelEvent::Closed`] follows when
+    /// the peer confirms.
+    pub fn disconnect(&mut self, local_cid: u16) {
+        let Some(index) = self
+            .channels
+            .iter()
+            .position(|c| c.is_some_and(|c| c.local_cid == local_cid))
+        else {
+            return;
+        };
+        let Some(channel) = self.channels[index] else {
+            return;
+        };
+        if channel.remote_cid == 0 {
+            // Still connecting: the peer has nothing to close yet.
+            self.channels[index] = None;
+            return self.push_event(ChannelEvent::Failed(channel));
+        }
+        let ident = self.ident();
+        let (d, s) = (channel.remote_cid.to_le_bytes(), local_cid.to_le_bytes());
+        self.signal(
+            channel.handle,
+            code::DISCONNECTION_REQUEST,
+            ident,
+            &[d[0], d[1], s[0], s[1]],
+        );
+    }
+
     /// The next PDU to send.
     pub fn pop_outbound(&mut self) -> Option<Outbound> {
         let first = self.outbox.iter().position(Option::is_some)?;
@@ -539,11 +605,23 @@ impl L2cap {
                 };
                 self.signal(handle, code::INFORMATION_RESPONSE, ident, &out[..len]);
             }
-            // Answers to requests we never send, and peers' rejections.
-            code::COMMAND_REJECT
-            | code::CONNECTION_RESPONSE
-            | code::ECHO_RESPONSE
-            | code::INFORMATION_RESPONSE => {}
+            code::CONNECTION_RESPONSE => {
+                let (Some(dcid), Some(scid), Some(result)) = (u16_at(0), u16_at(2), u16_at(4))
+                else {
+                    return;
+                };
+                self.on_connection_response(handle, ident, dcid, scid, result);
+            }
+            code::COMMAND_REJECT => {
+                // A rejected connection request fails its channel.
+                if let Some(i) = self.connecting(handle, ident)
+                    && let Some(channel) = self.channels[i].take()
+                {
+                    self.push_event(ChannelEvent::Failed(channel));
+                }
+            }
+            // Answers to requests we never send.
+            code::ECHO_RESPONSE | code::INFORMATION_RESPONSE => {}
             _ => self.reject(handle, ident),
         }
     }
@@ -574,24 +652,71 @@ impl L2cap {
         let local_cid = self.allocate_cid();
         respond(self, local_cid, connection::SUCCESS);
 
-        // Our configuration request: just our MTU.
-        let config_ident = self.ident();
+        let config_ident = self.request_configuration(handle, scid);
         self.channels[slot] = Some(Channel {
             handle,
             psm,
             local_cid,
             remote_cid: scid,
             remote_mtu: MTU,
+            outgoing: false,
             ours_done: false,
             theirs_done: false,
             config_ident,
         });
+    }
+
+    /// Sends our configuration request, just our MTU, and returns its
+    /// identifier.
+    fn request_configuration(&mut self, handle: ConnHandle, remote_cid: u16) -> u8 {
+        let ident = self.ident();
         let mut out = [0u8; 8];
-        out[0..2].copy_from_slice(&scid.to_le_bytes());
+        out[0..2].copy_from_slice(&remote_cid.to_le_bytes());
         out[4] = config::MTU;
         out[5] = 2;
         out[6..8].copy_from_slice(&MTU.to_le_bytes());
-        self.signal(handle, code::CONFIGURATION_REQUEST, config_ident, &out);
+        self.signal(handle, code::CONFIGURATION_REQUEST, ident, &out);
+        ident
+    }
+
+    /// The slot of our channel whose connection request was `ident`.
+    fn connecting(&self, handle: ConnHandle, ident: u8) -> Option<usize> {
+        self.channels.iter().position(|c| {
+            c.is_some_and(|c| {
+                c.handle == handle && c.outgoing && c.remote_cid == 0 && c.config_ident == ident
+            })
+        })
+    }
+
+    fn on_connection_response(
+        &mut self,
+        handle: ConnHandle,
+        ident: u8,
+        dcid: u16,
+        scid: u16,
+        result: u16,
+    ) {
+        let Some(index) = self.connecting(handle, ident) else {
+            return;
+        };
+        let Some(mut channel) = self.channels[index] else {
+            return;
+        };
+        if channel.local_cid != scid {
+            return;
+        }
+        match result {
+            connection::SUCCESS if dcid >= FIRST_DYNAMIC_CID => {
+                channel.remote_cid = dcid;
+                channel.config_ident = self.request_configuration(handle, dcid);
+                self.channels[index] = Some(channel);
+            }
+            connection::PENDING => {}
+            _ => {
+                self.channels[index] = None;
+                self.push_event(ChannelEvent::Failed(channel));
+            }
+        }
     }
 
     fn on_configuration_request(
@@ -1013,6 +1138,144 @@ mod tests {
         l2cap.disconnected(handle());
         assert!(matches!(l2cap.pop_event(), Some(ChannelEvent::Closed(_))));
         assert!(feed(&mut l2cap, &pdu(0x0040, b"x")).is_none());
+    }
+
+    /// Asks for an RFCOMM channel and returns our CID and the request's
+    /// identifier.
+    fn connect(l2cap: &mut L2cap) -> (u16, u8) {
+        let cid = l2cap.connect(handle(), psm::RFCOMM).unwrap();
+        let out = outbox(l2cap);
+        let ident = out[0][5];
+        let c = cid.to_le_bytes();
+        assert_eq!(
+            out,
+            [signal(
+                code::CONNECTION_REQUEST,
+                ident,
+                &[0x03, 0x00, c[0], c[1]]
+            )]
+        );
+        (cid, ident)
+    }
+
+    #[test]
+    fn opens_a_channel_to_the_peer() {
+        let mut l2cap = l2cap();
+        let (cid, ident) = connect(&mut l2cap);
+        let c = cid.to_le_bytes();
+
+        // Pending first, then success with the peer's CID 0x0080.
+        feed(
+            &mut l2cap,
+            &signal(
+                code::CONNECTION_RESPONSE,
+                ident,
+                &[0, 0, c[0], c[1], 0x01, 0x00, 0, 0],
+            ),
+        );
+        assert!(outbox(&mut l2cap).is_empty());
+        feed(
+            &mut l2cap,
+            &signal(
+                code::CONNECTION_RESPONSE,
+                ident,
+                &[0x80, 0x00, c[0], c[1], 0, 0, 0, 0],
+            ),
+        );
+        let out = outbox(&mut l2cap);
+        let our_ident = out[0][5];
+        assert_eq!(
+            out,
+            [signal(
+                code::CONFIGURATION_REQUEST,
+                our_ident,
+                &[0x80, 0x00, 0, 0, 0x01, 0x02, 0xa0, 0x02]
+            )]
+        );
+
+        feed(
+            &mut l2cap,
+            &signal(
+                code::CONFIGURATION_RESPONSE,
+                our_ident,
+                &[c[0], c[1], 0, 0, 0, 0],
+            ),
+        );
+        feed(
+            &mut l2cap,
+            &signal(
+                code::CONFIGURATION_REQUEST,
+                3,
+                &[c[0], c[1], 0, 0, 0x01, 0x02, 0x00, 0x01],
+            ),
+        );
+        assert_eq!(
+            outbox(&mut l2cap),
+            [signal(
+                code::CONFIGURATION_RESPONSE,
+                3,
+                &[0x80, 0x00, 0, 0, 0, 0]
+            )]
+        );
+        let Some(ChannelEvent::Opened(channel)) = l2cap.pop_event() else {
+            panic!("channel not opened");
+        };
+        assert!(channel.outgoing);
+        assert_eq!((channel.remote_cid, channel.remote_mtu), (0x0080, 256));
+
+        l2cap.send(cid, b"hi").unwrap();
+        assert_eq!(outbox(&mut l2cap), [pdu(0x0080, b"hi")]);
+
+        // We close it.
+        l2cap.disconnect(cid);
+        let out = outbox(&mut l2cap);
+        let ident = out[0][5];
+        assert_eq!(
+            out,
+            [signal(
+                code::DISCONNECTION_REQUEST,
+                ident,
+                &[0x80, 0x00, c[0], c[1]]
+            )]
+        );
+        feed(
+            &mut l2cap,
+            &signal(
+                code::DISCONNECTION_RESPONSE,
+                ident,
+                &[0x80, 0x00, c[0], c[1]],
+            ),
+        );
+        assert!(matches!(l2cap.pop_event(), Some(ChannelEvent::Closed(_))));
+        assert!(l2cap.channel(cid).is_none());
+    }
+
+    #[test]
+    fn a_refused_connection_fails() {
+        let mut l2cap = l2cap();
+        let (cid, ident) = connect(&mut l2cap);
+        let c = cid.to_le_bytes();
+        feed(
+            &mut l2cap,
+            &signal(
+                code::CONNECTION_RESPONSE,
+                ident,
+                &[0, 0, c[0], c[1], 0x02, 0x00, 0, 0],
+            ),
+        );
+        assert!(matches!(l2cap.pop_event(), Some(ChannelEvent::Failed(c)) if c.local_cid == cid));
+        assert!(l2cap.channel(cid).is_none());
+
+        // A command reject fails the request too.
+        let (cid, ident) = connect(&mut l2cap);
+        feed(&mut l2cap, &signal(code::COMMAND_REJECT, ident, &[0, 0]));
+        assert!(matches!(l2cap.pop_event(), Some(ChannelEvent::Failed(c)) if c.local_cid == cid));
+    }
+
+    #[test]
+    fn connect_needs_a_link() {
+        let mut l2cap = L2cap::new();
+        assert_eq!(l2cap.connect(handle(), psm::SDP), None);
     }
 
     #[test]

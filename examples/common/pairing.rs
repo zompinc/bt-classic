@@ -135,6 +135,7 @@ impl Handler for Console {
         let (what, channel) = match event {
             ChannelEvent::Opened(c) => ("opened", c),
             ChannelEvent::Closed(c) => ("closed", c),
+            ChannelEvent::Failed(c) => ("refused", c),
         };
         println!(
             "   L2CAP channel {what}: PSM 0x{:04x}, local 0x{:04x}, remote 0x{:04x}, peer MTU {}",
