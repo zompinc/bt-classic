@@ -12,7 +12,7 @@
 #![no_main]
 
 use bt_classic::gap::{self, ClassOfDevice, ControllerInfo, audio_video, major, service};
-use bt_classic::host::{self, Handler, RfcommTx, Stack};
+use bt_classic::host::{self, Handler, Requests, RfcommTx, Stack};
 use bt_classic::l2cap::ChannelEvent;
 use bt_classic::rfcomm::Dlc;
 use bt_classic::rfcomm_service_record;
@@ -144,7 +144,8 @@ async fn main(_spawner: Spawner) {
         }
     };
     let mut handler = Echo;
-    let run = host::run(&hci, &mut stack, &config, &mut handler);
+    let requests = Requests::new();
+    let run = host::run(&hci, &mut stack, &config, &mut handler, &requests);
     // The heartbeat never ends, so only the runner can finish the select.
     let embassy_futures::select::Either::First(error) =
         embassy_futures::select::select(run, heartbeat).await;

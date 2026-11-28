@@ -1,5 +1,6 @@
-//! RFCOMM as the responding side (Bluetooth RFCOMM 1.2 over 3GPP TS 07.10):
-//! serial-port channels that a peer opens over an L2CAP channel on PSM 3.
+//! RFCOMM (Bluetooth RFCOMM 1.2 over 3GPP TS 07.10): serial-port channels
+//! over an L2CAP channel on PSM 3, opened by the peer or by us with
+//! [`Rfcomm::connect`].
 //!
 //! Like the other protocol layers it does no I/O. The runner tells it when
 //! an RFCOMM L2CAP channel opens or closes and hands it each SDU; it returns
@@ -9,8 +10,8 @@
 //!
 //! Supported: the multiplexer on DLCI 0, PN (parameter negotiation),
 //! credit-based flow control, MSC, RPN, RLS and Test answered, NSC for the
-//! rest. Not supported: opening a session or channel ourselves, and
-//! aggregate flow control (FCon/FCoff are acknowledged but ignored).
+//! rest. Not supported: aggregate flow control (FCon/FCoff are acknowledged
+//! but ignored).
 
 /// RFCOMM's L2CAP PSM.
 pub const PSM: u16 = crate::l2cap::psm::RFCOMM;
@@ -105,6 +106,9 @@ impl Dlc {
 pub enum RfcommEvent {
     Opened(Dlc),
     Closed(Dlc),
+    /// A channel we asked for with [`Rfcomm::connect`] was refused, or its
+    /// session went away before it opened.
+    Failed(Dlc),
 }
 
 /// Data that arrived on an open channel.
@@ -143,11 +147,15 @@ struct Session {
     /// The largest RFCOMM frame the L2CAP channel carries.
     l2cap_mtu: u16,
     open: bool,
+    /// We opened the multiplexer: our commands carry C/R 1.
+    initiator: bool,
 }
 
 struct DlcState {
     dlc: Dlc,
     open: bool,
+    /// We asked for it with [`Rfcomm::connect`].
+    outgoing: bool,
     /// Negotiated with PN; [`DEFAULT_FRAME`] otherwise.
     frame_size: u16,
     credit_flow: bool,
@@ -224,8 +232,44 @@ impl Rfcomm {
                 l2cap_cid,
                 l2cap_mtu,
                 open: false,
+                initiator: false,
             });
         }
+    }
+
+    /// Opens a channel to the peer's server `channel` (1 to 30) on the RFCOMM
+    /// L2CAP channel `l2cap_cid`, starting the multiplexer first if nobody
+    /// has. Returns the channel, or `None` if there is no such session, no
+    /// room, or it is already open or opening. [`RfcommEvent::Opened`]
+    /// follows, or [`RfcommEvent::Failed`].
+    pub fn connect(&mut self, l2cap_cid: u16, channel: u8) -> Option<Dlc> {
+        if !(1..=30).contains(&channel) {
+            return None;
+        }
+        let session = self.session(l2cap_cid)?;
+        let start = !session.open;
+        let initiator = start || session.initiator;
+        // The initiator reaches the responder's servers on even DLCIs, the
+        // responder the initiator's on odd ones (RFCOMM 5.4).
+        let dlc = Dlc {
+            l2cap_cid,
+            dlci: (channel << 1) | u8::from(!initiator),
+        };
+        if self.state(dlc).is_some() || !self.new_dlc(dlc, DEFAULT_FRAME, false, 0) {
+            return None;
+        }
+        if let Some(state) = self.state_mut(dlc) {
+            state.outgoing = true;
+        }
+        if start {
+            if let Some(session) = self.session_mut(l2cap_cid) {
+                session.initiator = true;
+            }
+            self.queue_frame(l2cap_cid, 0, control::SABM | control::PF, false, &[]);
+        } else {
+            self.request_parameters(dlc);
+        }
+        Some(dlc)
     }
 
     /// An RFCOMM L2CAP channel closed: its channels close too.
@@ -239,10 +283,12 @@ impl Rfcomm {
             if let Some(state) = &self.dlcs[i]
                 && state.dlc.l2cap_cid == l2cap_cid
             {
-                let (dlc, was_open) = (state.dlc, state.open);
+                let (dlc, was_open, outgoing) = (state.dlc, state.open, state.outgoing);
                 self.dlcs[i] = None;
                 if was_open {
                     self.push_event(RfcommEvent::Closed(dlc));
+                } else if outgoing {
+                    self.push_event(RfcommEvent::Failed(dlc));
                 }
             }
         }
@@ -334,6 +380,7 @@ impl Rfcomm {
                         l2cap_cid: cid,
                         l2cap_mtu: crate::l2cap::MIN_MTU,
                         open: false,
+                        initiator: false,
                     });
                 }
                 None
@@ -349,7 +396,59 @@ impl Rfcomm {
                 self.close(dlc);
                 None
             }
-            control::UA | control::DM => None, // we send no commands that expect these
+            control::UA if dlci == 0 => {
+                // The multiplexer we started is up: negotiate the channels
+                // waiting for it.
+                if let Some(session) = self.session_mut(l2cap_cid)
+                    && session.initiator
+                    && !session.open
+                {
+                    session.open = true;
+                    for i in 0..MAX_DLCS {
+                        if let Some(dlc) = self.dlcs[i]
+                            .as_ref()
+                            .filter(|s| s.outgoing && !s.open && s.dlc.l2cap_cid == l2cap_cid)
+                            .map(|s| s.dlc)
+                        {
+                            self.request_parameters(dlc);
+                        }
+                    }
+                }
+                None
+            }
+            control::UA => {
+                let dlc = Dlc { l2cap_cid, dlci };
+                if let Some(state) = self.state_mut(dlc).filter(|s| s.outgoing && !s.open) {
+                    state.open = true;
+                    self.push_event(RfcommEvent::Opened(dlc));
+                    self.queue_mcc(l2cap_cid, mcc::MSC, true, &[(dlci << 2) | 0x03, 0x8d]);
+                }
+                None
+            }
+            control::DM if dlci == 0 => {
+                // The peer refused the multiplexer: nothing on it can open.
+                for i in 0..MAX_DLCS {
+                    if let Some(dlc) = self.dlcs[i]
+                        .as_ref()
+                        .filter(|s| s.outgoing && !s.open && s.dlc.l2cap_cid == l2cap_cid)
+                        .map(|s| s.dlc)
+                    {
+                        self.dlcs[i] = None;
+                        self.push_event(RfcommEvent::Failed(dlc));
+                    }
+                }
+                None
+            }
+            control::DM => {
+                let dlc = Dlc { l2cap_cid, dlci };
+                if self.state(dlc).is_some_and(|s| s.outgoing && !s.open) {
+                    self.remove(dlc);
+                    self.push_event(RfcommEvent::Failed(dlc));
+                } else {
+                    self.close(dlc);
+                }
+                None
+            }
             control::UIH if dlci == 0 => {
                 let mut message = [0u8; 64];
                 let n = len.min(message.len());
@@ -428,7 +527,12 @@ impl Rfcomm {
             } else {
                 control::UIH
             };
-            let mut at = header(&mut frame.bytes, state.dlc.dlci, ctrl, false, n);
+            let initiator = self
+                .sessions
+                .iter()
+                .flatten()
+                .any(|s| s.l2cap_cid == state.dlc.l2cap_cid && s.initiator);
+            let mut at = header(&mut frame.bytes, state.dlc.dlci, ctrl, initiator, n);
             if grant > 0 {
                 frame.bytes[at] = grant;
                 at += 1;
@@ -482,6 +586,7 @@ impl Rfcomm {
         *slot = Some(DlcState {
             dlc,
             open: false,
+            outgoing: false,
             frame_size,
             credit_flow,
             tx_credits,
@@ -491,6 +596,53 @@ impl Rfcomm {
             tx_len: 0,
         });
         true
+    }
+
+    /// Forgets `dlc` without an event.
+    fn remove(&mut self, dlc: Dlc) {
+        for slot in &mut self.dlcs {
+            if slot.as_ref().is_some_and(|s| s.dlc == dlc) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Sends PN for a channel we are opening: credit flow, the largest frame
+    /// one L2CAP SDU holds, and our initial credits.
+    fn request_parameters(&mut self, dlc: Dlc) {
+        let l2cap_mtu = self
+            .session(dlc.l2cap_cid)
+            .map_or(crate::l2cap::MIN_MTU, |s| s.l2cap_mtu);
+        let size = (MAX_FRAME as u16)
+            .min(l2cap_mtu.saturating_sub(6))
+            .to_le_bytes();
+        self.queue_mcc(
+            dlc.l2cap_cid,
+            mcc::PN,
+            true,
+            &[dlc.dlci, 0xf0, 7, 0, size[0], size[1], 0, RX_CREDITS],
+        );
+    }
+
+    /// The peer's answer to our PN: take its parameters and open the
+    /// channel.
+    fn on_pn_response(&mut self, l2cap_cid: u16, value: &[u8]) {
+        let dlc = Dlc {
+            l2cap_cid,
+            dlci: value[0] & 0x3f,
+        };
+        let Some(state) = self.state_mut(dlc).filter(|s| s.outgoing && !s.open) else {
+            return;
+        };
+        state.credit_flow = value[1] & 0xf0 == 0xe0;
+        state.tx_credits = if state.credit_flow {
+            u16::from(value[7] & 0x07)
+        } else {
+            0
+        };
+        state.rx_credits = if state.credit_flow { RX_CREDITS } else { 0 };
+        state.frame_size = u16::from_le_bytes([value[4], value[5]]).clamp(1, MAX_FRAME as u16);
+        self.queue_frame(l2cap_cid, dlc.dlci, control::SABM | control::PF, false, &[]);
     }
 
     fn close(&mut self, dlc: Dlc) {
@@ -524,7 +676,11 @@ impl Rfcomm {
         let command = type_byte & 0x02 != 0;
         let kind = type_byte >> 2;
         if !command {
-            return; // responses to our MSC
+            // Responses: only PN's carries anything we need.
+            if kind == mcc::PN && value.len() >= 8 {
+                self.on_pn_response(l2cap_cid, value);
+            }
+            return;
         }
         match kind {
             mcc::PN if value.len() >= 8 => self.on_pn(l2cap_cid, value),
@@ -601,11 +757,12 @@ impl Rfcomm {
     /// Queues a frame we build: `response` sets C/R as a responder's
     /// response, UIH frames use the command C/R.
     fn queue_frame(&mut self, l2cap_cid: u16, dlci: u8, ctrl: u8, response: bool, info: &[u8]) {
+        let initiator = self.session(l2cap_cid).is_some_and(|s| s.initiator);
         let Some(slot) = self.control.iter_mut().find(|c| c.is_none()) else {
             return;
         };
         let mut bytes = [0u8; 16];
-        let at = header(&mut bytes, dlci, ctrl, response, info.len());
+        let at = header(&mut bytes, dlci, ctrl, initiator != response, info.len());
         bytes[at..at + info.len()].copy_from_slice(info);
         let checked = if ctrl & !control::PF == control::UIH {
             2
@@ -650,10 +807,10 @@ impl Rfcomm {
 }
 
 /// Writes address, control and length into `out`; returns where the
-/// information field starts. We are the responder: our commands and UIH
-/// frames carry C/R 0, our responses C/R 1.
-fn header(out: &mut [u8], dlci: u8, ctrl: u8, response: bool, len: usize) -> usize {
-    out[0] = (dlci << 2) | (u8::from(response) << 1) | 1;
+/// information field starts. The initiator's commands and UIH frames carry
+/// C/R 1 and its responses C/R 0; the responder's the other way round.
+fn header(out: &mut [u8], dlci: u8, ctrl: u8, cr: bool, len: usize) -> usize {
+    out[0] = (dlci << 2) | (u8::from(cr) << 1) | 1;
     out[1] = ctrl;
     if len <= 127 {
         out[2] = ((len as u8) << 1) | 1;
@@ -911,5 +1068,120 @@ mod tests {
         rfcomm.l2cap_closed(CID);
         assert_eq!(rfcomm.pop_event(), Some(RfcommEvent::Closed(dlc)));
         assert!(!rfcomm.is_open(dlc));
+    }
+
+    /// A frame from the peer when we initiated: its commands and UIH frames
+    /// carry C/R 0, its responses C/R 1.
+    fn from_responder(dlci: u8, ctrl: u8, response: bool, info: &[u8]) -> Vec<u8> {
+        let mut f = std::vec![(dlci << 2) | (u8::from(response) << 1) | 1, ctrl];
+        f.push(((info.len() as u8) << 1) | 1);
+        let checked = if ctrl & !control::PF == control::UIH {
+            2
+        } else {
+            f.len()
+        };
+        f.extend_from_slice(info);
+        f.push(fcs(&f[..checked]));
+        f
+    }
+
+    #[test]
+    fn opens_a_channel_on_the_peer() {
+        let mut rfcomm = Rfcomm::new();
+        rfcomm.l2cap_opened(CID, 672);
+        let dlc = rfcomm.connect(CID, 3).unwrap();
+        assert_eq!(dlc.dlci, 6, "the initiator uses even DLCIs");
+        assert_eq!(rfcomm.connect(CID, 3), None, "already opening");
+
+        // SABM on DLCI 0 as a command from the initiator: C/R 1.
+        assert_eq!(outbound(&mut rfcomm), [std::vec![0x03, 0x3f, 0x01, 0x1c]]);
+        rfcomm.on_data(CID, &from_responder(0, 0x73, true, &[]));
+
+        // PN command: DLCI 6, credit flow, frame size for an MTU of 672, k 4.
+        let size = (672u16 - 6).to_le_bytes();
+        let out = outbound(&mut rfcomm);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0][0], 0x03, "UIH from the initiator: C/R 1");
+        assert_eq!(
+            &out[0][3..out[0].len() - 1],
+            &[0x83, 0x11, 6, 0xf0, 7, 0, size[0], size[1], 0, 4]
+        );
+
+        // PN response accepting credit flow, frame size 100, 7 credits.
+        rfcomm.on_data(
+            CID,
+            &from_responder(
+                0,
+                control::UIH,
+                false,
+                &[0x81, 0x11, 6, 0xe0, 7, 0, 100, 0, 0, 7],
+            ),
+        );
+        let out = outbound(&mut rfcomm);
+        assert_eq!(
+            out,
+            [{
+                let mut sabm = std::vec![(6 << 2) | 0x03, 0x3f, 0x01];
+                sabm.push(fcs(&sabm));
+                sabm
+            }]
+        );
+        assert!(!rfcomm.is_open(dlc));
+
+        rfcomm.on_data(CID, &from_responder(6, 0x73, true, &[]));
+        assert_eq!(rfcomm.pop_event(), Some(RfcommEvent::Opened(dlc)));
+        let out = outbound(&mut rfcomm);
+        // Our MSC command.
+        assert_eq!(&out[0][3..7], &[0xe3, 0x05, (6 << 2) | 0x03, 0x8d]);
+
+        // Data goes out in frames of the negotiated size, as a command: C/R 1.
+        rfcomm.send(dlc, &[9u8; 150]).unwrap();
+        let out = outbound(&mut rfcomm);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0][0], (6 << 2) | 0x03);
+        assert_eq!(out[0][2], (100 << 1) | 1);
+
+        // Data from the peer arrives.
+        let data = from_responder(6, control::UIH, false, b"OK");
+        assert_eq!(rfcomm.on_data(CID, &data).unwrap().data, b"OK");
+    }
+
+    #[test]
+    fn a_refused_channel_fails() {
+        let mut rfcomm = Rfcomm::new();
+        rfcomm.l2cap_opened(CID, 672);
+        let dlc = rfcomm.connect(CID, 3).unwrap();
+        rfcomm.on_data(CID, &from_responder(0, 0x73, true, &[]));
+        let _ = outbound(&mut rfcomm);
+        rfcomm.on_data(CID, &from_responder(6, 0x1f, true, &[]));
+        assert_eq!(rfcomm.pop_event(), Some(RfcommEvent::Failed(dlc)));
+        assert_eq!(rfcomm.send(dlc, b"x"), Err(SendError::NotOpen));
+
+        // A refused multiplexer fails what waits for it.
+        let mut rfcomm = Rfcomm::new();
+        rfcomm.l2cap_opened(CID, 672);
+        let dlc = rfcomm.connect(CID, 3).unwrap();
+        rfcomm.on_data(CID, &from_responder(0, 0x1f, true, &[]));
+        assert_eq!(rfcomm.pop_event(), Some(RfcommEvent::Failed(dlc)));
+
+        // So does losing the L2CAP channel.
+        let mut rfcomm = Rfcomm::new();
+        rfcomm.l2cap_opened(CID, 672);
+        let dlc = rfcomm.connect(CID, 3).unwrap();
+        rfcomm.l2cap_closed(CID);
+        assert_eq!(rfcomm.pop_event(), Some(RfcommEvent::Failed(dlc)));
+    }
+
+    #[test]
+    fn opens_a_channel_on_a_session_the_peer_started() {
+        let mut rfcomm = rfcomm();
+        open(&mut rfcomm);
+        // We are the responder here, so the peer's server 3 is on DLCI 7,
+        // and our frames keep the responder's C/R.
+        let dlc = rfcomm.connect(CID, 3).unwrap();
+        assert_eq!(dlc.dlci, 7);
+        let out = outbound(&mut rfcomm);
+        assert_eq!(out[0][0], 0x01);
+        assert_eq!(&out[0][3..6], &[0x83, 0x11, 7]);
     }
 }

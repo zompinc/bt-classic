@@ -732,6 +732,188 @@ impl<'r> SdpServer<'r> {
     }
 }
 
+/// The longest attribute list [`SdpClient`] collects across continuations.
+pub const MAX_CLIENT_BODY: usize = 512;
+/// The longest request [`SdpClient`] writes.
+pub const MAX_CLIENT_REQUEST: usize = 32;
+
+/// What [`SdpClient::on_response`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Lookup {
+    /// Send the continuation request written to `out`, this long.
+    Next(usize),
+    /// The service's RFCOMM server channel.
+    Found(u8),
+    /// No record of the service has an RFCOMM channel.
+    NotFound,
+    /// The peer answered with an error or something unreadable.
+    Failed,
+}
+
+/// Looks up a service's RFCOMM server channel on a peer's SDP server, with
+/// a Service Search Attribute request for its ProtocolDescriptorList. It
+/// does no I/O: send what [`SdpClient::start`] writes on an SDP channel you
+/// opened, and hand it each response.
+pub struct SdpClient {
+    uuid: u16,
+    transaction: u16,
+    body: [u8; MAX_CLIENT_BODY],
+    body_len: usize,
+}
+
+impl Default for SdpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SdpClient {
+    pub const fn new() -> Self {
+        Self {
+            uuid: 0,
+            transaction: 0,
+            body: [0; MAX_CLIENT_BODY],
+            body_len: 0,
+        }
+    }
+
+    /// Starts looking up the service class `uuid`: writes the first request
+    /// to `out`, which must hold [`MAX_CLIENT_REQUEST`] bytes, and returns
+    /// its length.
+    pub fn start(&mut self, uuid: u16, out: &mut [u8]) -> usize {
+        self.uuid = uuid;
+        self.body_len = 0;
+        self.request(&[0], out)
+    }
+
+    /// Handles a response PDU. A continuation request goes to `out`.
+    pub fn on_response(&mut self, response: &[u8], out: &mut [u8]) -> Lookup {
+        let Some((&id, rest)) = response.split_first() else {
+            return Lookup::Failed;
+        };
+        let Some(transaction) = rest.get(..2) else {
+            return Lookup::Failed;
+        };
+        if id != pdu::SERVICE_SEARCH_ATTRIBUTE_RESPONSE
+            || u16::from_be_bytes([transaction[0], transaction[1]]) != self.transaction
+        {
+            return Lookup::Failed;
+        }
+        // The parameter length, then AttributeListsByteCount and the lists.
+        let Some(count) = rest.get(4..6) else {
+            return Lookup::Failed;
+        };
+        let count = usize::from(u16::from_be_bytes([count[0], count[1]]));
+        let (Some(lists), Some(continuation)) = (rest.get(6..6 + count), rest.get(6 + count..))
+        else {
+            return Lookup::Failed;
+        };
+        let Some(&cont_len) = continuation.first() else {
+            return Lookup::Failed;
+        };
+        let Some(state) = continuation.get(..1 + usize::from(cont_len)) else {
+            return Lookup::Failed;
+        };
+        if self.body_len + lists.len() > self.body.len() {
+            return Lookup::Failed;
+        }
+        self.body[self.body_len..self.body_len + lists.len()].copy_from_slice(lists);
+        self.body_len += lists.len();
+        if cont_len > 0 {
+            return match self.request(state, out) {
+                0 => Lookup::Failed,
+                n => Lookup::Next(n),
+            };
+        }
+        let body = &self.body[..self.body_len];
+        match rfcomm_channel(body) {
+            Some(channel) => Lookup::Found(channel),
+            None if parse_sequence(body).is_some() => Lookup::NotFound,
+            None => Lookup::Failed,
+        }
+    }
+
+    /// Writes a request carrying `continuation`, its length byte included.
+    fn request(&mut self, continuation: &[u8], out: &mut [u8]) -> usize {
+        self.transaction = self.transaction.wrapping_add(1);
+        let t = self.transaction.to_be_bytes();
+        let uuid = self.uuid.to_be_bytes();
+        let max = (MAX_CLIENT_BODY as u16).to_be_bytes();
+        let id = attribute::PROTOCOL_DESCRIPTOR_LIST.to_be_bytes();
+        // Continuation state is at most 16 bytes.
+        let continuation = &continuation[..continuation.len().min(17)];
+        let params_len = (12 + continuation.len()) as u16;
+        let len = params_len.to_be_bytes();
+        let mut w = Writer::new(out);
+        let request = [
+            pdu::SERVICE_SEARCH_ATTRIBUTE_REQUEST,
+            t[0],
+            t[1],
+            len[0],
+            len[1],
+            // ServiceSearchPattern: one 16-bit UUID.
+            0x35,
+            3,
+            0x19,
+            uuid[0],
+            uuid[1],
+            // MaximumAttributeByteCount.
+            max[0],
+            max[1],
+            // AttributeIDList: just the ProtocolDescriptorList.
+            0x35,
+            3,
+            0x09,
+            id[0],
+            id[1],
+        ];
+        if w.bytes(&request).is_err() || w.bytes(continuation).is_err() {
+            return 0;
+        }
+        w.len()
+    }
+}
+
+/// The first RFCOMM channel in the ProtocolDescriptorLists of `lists`, a
+/// sequence of attribute lists.
+fn rfcomm_channel(lists: &[u8]) -> Option<u8> {
+    let (mut records, _) = parse_sequence(lists)?;
+    while !records.is_empty() {
+        let (mut attributes, rest) = parse_sequence(records)?;
+        records = rest;
+        while !attributes.is_empty() {
+            let (kind_id, id, rest) = parse_element(attributes)?;
+            let (kind_value, value, rest) = parse_element(rest)?;
+            attributes = rest;
+            if kind_id == kind::UINT
+                && id == attribute::PROTOCOL_DESCRIPTOR_LIST.to_be_bytes()
+                && kind_value == kind::SEQUENCE
+                && let Some(channel) = rfcomm_in_protocols(value)
+            {
+                return Some(channel);
+            }
+        }
+    }
+    None
+}
+
+/// The RFCOMM channel in a ProtocolDescriptorList's contents: the
+/// descriptor whose UUID is RFCOMM carries it as its parameter.
+fn rfcomm_in_protocols(mut descriptors: &[u8]) -> Option<u8> {
+    while !descriptors.is_empty() {
+        let (descriptor, rest) = parse_sequence(descriptors)?;
+        descriptors = rest;
+        let (kind_uuid, uuid, params) = parse_element(descriptor)?;
+        if parse_uuid(kind_uuid, uuid) == Some(uuid_from_short(u32::from(uuid::RFCOMM)))
+            && let Some((kind::UINT, &[channel], _)) = parse_element(params)
+        {
+            return Some(channel);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -941,4 +1123,64 @@ mod tests {
             [0x01, 0x12, 0x34, 0, 2, 0, 5]
         );
     }
+
+    /// Runs a lookup for `uuid` against `server`, answering with at most
+    /// `mtu` bytes per response.
+    fn look_up(server: &mut SdpServer<'_>, uuid: u16, mtu: u16) -> (Lookup, usize) {
+        let mut client = SdpClient::new();
+        let mut request = [0u8; MAX_CLIENT_REQUEST];
+        let mut len = client.start(uuid, &mut request);
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            let mut response = [0u8; 1024];
+            let n = server.handle(&request[..len], mtu, &mut response);
+            match client.on_response(&response[..n], &mut request) {
+                Lookup::Next(next) => len = next,
+                done => return (done, rounds),
+            }
+        }
+    }
+
+    #[test]
+    fn client_finds_the_rfcomm_channel() {
+        let mut server = SdpServer::new(&RECORDS);
+        assert_eq!(
+            look_up(&mut server, uuid::HEADSET, 672),
+            (Lookup::Found(6), 1)
+        );
+        assert_eq!(
+            look_up(&mut server, uuid::SERIAL_PORT, 672),
+            (Lookup::NotFound, 1)
+        );
+    }
+
+    #[test]
+    fn client_follows_continuations() {
+        let mut server = SdpServer::new(&RECORDS);
+        let (found, rounds) = look_up(&mut server, uuid::HEADSET, MIN_TEST_MTU);
+        assert_eq!(found, Lookup::Found(6));
+        assert!(rounds > 1, "{rounds} round(s)");
+    }
+
+    #[test]
+    fn client_rejects_errors_and_other_transactions() {
+        let mut client = SdpClient::new();
+        let mut out = [0u8; MAX_CLIENT_REQUEST];
+        client.start(uuid::HEADSET, &mut out);
+        // An error response.
+        assert_eq!(
+            client.on_response(&[0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03], &mut out),
+            Lookup::Failed
+        );
+        // The right PDU with another transaction ID.
+        assert_eq!(
+            client.on_response(&[0x07, 0x00, 0x09, 0x00, 0x03, 0x00, 0x00, 0x00], &mut out),
+            Lookup::Failed
+        );
+    }
+
+    /// Small enough that the headset record's attribute list takes several
+    /// responses.
+    const MIN_TEST_MTU: u16 = 16;
 }

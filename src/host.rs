@@ -1,5 +1,7 @@
 //! The async runner: brings the controller up, then reads it, drives
-//! [`Security`], [`L2cap`] and the [`SdpServer`], and sends their replies.
+//! [`Security`], [`L2cap`], [`Rfcomm`] and SDP, and sends their replies.
+//! It also connects profiles on the application's behalf; see
+//! [`Requests`].
 //!
 //! A command only completes while something reads the controller, so
 //! [`run`] reads in one future and handles packets in another, joined by a
@@ -18,7 +20,7 @@ use bt_hci::cmd::link_control::{
 use bt_hci::controller::{Controller, ControllerCmdSync};
 use bt_hci::data::{AclBroadcastFlag, AclPacket, AclPacketBoundary};
 use bt_hci::event::{Event, EventKind};
-use bt_hci::param::{ConnHandle, OobDataPresent};
+use bt_hci::param::{BdAddr, ConnHandle, OobDataPresent};
 use bt_hci::{ControllerToHostPacket, FromHciBytes};
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -29,7 +31,7 @@ use crate::cmd::PinCodeRequestNegativeReply;
 use crate::gap::{self, ClassicController, ControllerInfo};
 use crate::l2cap::{self, ChannelEvent, L2cap};
 use crate::rfcomm::{self, Dlc, Rfcomm, RfcommEvent, SendError};
-use crate::sdp::{self, SdpServer, ServiceRecord};
+use crate::sdp::{self, Lookup, SdpClient, SdpServer, ServiceRecord};
 use crate::security::{Action, ConfirmRequest, LinkKeyStore, Notice, Security, SecurityConfig};
 
 /// What the application hears from [`run`]. Every method has a default.
@@ -75,6 +77,19 @@ pub trait Handler {
         let _ = dlc;
     }
 
+    /// The profile asked for with [`Requests::connect_profile`] is connected
+    /// on `dlc`. Called just before [`Handler::rfcomm_opened`] for the same
+    /// channel, which then carries data like any other.
+    fn profile_connected(&mut self, bd_addr: BdAddr, uuid: u16, dlc: Dlc, tx: &mut RfcommTx<'_>) {
+        let _ = (bd_addr, uuid, dlc, tx);
+    }
+
+    /// The profile asked for with [`Requests::connect_profile`] could not be
+    /// connected.
+    fn profile_failed(&mut self, bd_addr: BdAddr, uuid: u16, error: ProfileError) {
+        let _ = (bd_addr, uuid, error);
+    }
+
     /// Numeric comparison: return whether the user confirmed that both
     /// devices show `request.numeric_value`. Only asked when both sides can
     /// display and answer; the default accepts.
@@ -115,6 +130,88 @@ impl RfcommTx<'_> {
     }
 }
 
+/// Why [`Requests::connect_profile`] failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ProfileError {
+    /// No ACL connection to the device: connect first.
+    NotConnected,
+    /// Another profile connection is in progress.
+    Busy,
+    /// No free L2CAP or RFCOMM slot.
+    NoResources,
+    /// The peer refused the L2CAP channel for SDP or RFCOMM.
+    ChannelRefused,
+    /// The peer's SDP answer was an error or unreadable.
+    LookupFailed,
+    /// The peer has no record of the service with an RFCOMM channel.
+    NotFound,
+    /// The peer refused the RFCOMM channel.
+    Refused,
+    /// The connection went down meanwhile.
+    Disconnected,
+}
+
+/// Something the application asks [`run`] to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Request {
+    /// See [`Requests::connect_profile`].
+    ConnectProfile { bd_addr: BdAddr, uuid: u16 },
+}
+
+/// Requests for [`run`], from code running alongside it in the same task.
+pub struct Requests {
+    channel: Channel<NoopRawMutex, Request, 2>,
+}
+
+impl Default for Requests {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Requests {
+    pub const fn new() -> Self {
+        Self {
+            channel: Channel::new(),
+        }
+    }
+
+    /// Connects to the service class `uuid` on the connected device
+    /// `bd_addr`, the way a client connects a profile: looks up the
+    /// service's RFCOMM channel with SDP and opens it. The outcome arrives
+    /// as [`Handler::profile_connected`] or [`Handler::profile_failed`].
+    /// Returns false if too many requests are waiting.
+    ///
+    /// The link should be authenticated and encrypted first; peers refuse
+    /// most profiles otherwise.
+    pub fn connect_profile(&self, bd_addr: BdAddr, uuid: u16) -> bool {
+        self.channel
+            .try_send(Request::ConnectProfile { bd_addr, uuid })
+            .is_ok()
+    }
+}
+
+/// Where a profile connection is.
+#[derive(Clone, Copy)]
+enum Step {
+    /// Waiting for the SDP channel, then for the lookup.
+    Lookup { cid: u16 },
+    /// Waiting for the RFCOMM L2CAP channel to open `channel` on it.
+    Session { cid: u16, channel: u8 },
+    /// Waiting for the RFCOMM channel.
+    Channel { dlc: Dlc },
+}
+
+#[derive(Clone, Copy)]
+struct Pending {
+    handle: ConnHandle,
+    bd_addr: BdAddr,
+    uuid: u16,
+    step: Step,
+}
+
 /// A [`Handler`] that ignores everything and accepts every confirmation.
 pub struct NoHandler;
 
@@ -129,6 +226,10 @@ pub struct Stack<'r, S> {
     /// Register server channels with `stack.rfcomm.register(channel)`.
     pub rfcomm: Rfcomm,
     pub keys: S,
+    sdp_client: SdpClient,
+    /// ACL links and their peers, for requests that name a device.
+    links: [Option<(ConnHandle, BdAddr)>; l2cap::MAX_CONNECTIONS],
+    profile: Option<Pending>,
 }
 
 impl<'r, S: LinkKeyStore> Stack<'r, S> {
@@ -144,6 +245,144 @@ impl<'r, S: LinkKeyStore> Stack<'r, S> {
             sdp: SdpServer::new(records),
             rfcomm: Rfcomm::new(),
             keys,
+            sdp_client: SdpClient::new(),
+            links: [None; l2cap::MAX_CONNECTIONS],
+            profile: None,
+        }
+    }
+
+    fn link_up(&mut self, handle: ConnHandle, bd_addr: BdAddr) {
+        self.link_down(handle);
+        if let Some(slot) = self.links.iter_mut().find(|l| l.is_none()) {
+            *slot = Some((handle, bd_addr));
+        }
+    }
+
+    fn link_down(&mut self, handle: ConnHandle) {
+        for link in &mut self.links {
+            if link.is_some_and(|(h, _)| h == handle) {
+                *link = None;
+            }
+        }
+    }
+
+    /// Starts a [`Request::ConnectProfile`]: opens the SDP channel.
+    fn start_profile<H: Handler>(&mut self, handler: &mut H, bd_addr: BdAddr, uuid: u16) {
+        if self.profile.is_some() {
+            return handler.profile_failed(bd_addr, uuid, ProfileError::Busy);
+        }
+        let Some((handle, _)) = self.links.iter().flatten().find(|(_, a)| *a == bd_addr) else {
+            return handler.profile_failed(bd_addr, uuid, ProfileError::NotConnected);
+        };
+        match self.l2cap.connect(*handle, sdp::PSM) {
+            Some(cid) => {
+                self.profile = Some(Pending {
+                    handle: *handle,
+                    bd_addr,
+                    uuid,
+                    step: Step::Lookup { cid },
+                });
+            }
+            None => handler.profile_failed(bd_addr, uuid, ProfileError::NoResources),
+        }
+    }
+
+    fn fail_profile<H: Handler>(&mut self, handler: &mut H, error: ProfileError) {
+        if let Some(p) = self.profile.take() {
+            handler.profile_failed(p.bd_addr, p.uuid, error);
+        }
+    }
+
+    /// The profile's L2CAP channel opened, failed or closed.
+    fn on_profile_channel<H: Handler>(&mut self, handler: &mut H, event: ChannelEvent) {
+        let Some(pending) = self.profile else {
+            return;
+        };
+        match (pending.step, event) {
+            (Step::Lookup { cid }, ChannelEvent::Opened(c)) if c.local_cid == cid => {
+                let mut request = [0u8; sdp::MAX_CLIENT_REQUEST];
+                let n = self.sdp_client.start(pending.uuid, &mut request);
+                if self.l2cap.send(cid, &request[..n]).is_err() {
+                    self.l2cap.disconnect(cid);
+                    self.fail_profile(handler, ProfileError::NoResources);
+                }
+            }
+            (Step::Session { cid, channel }, ChannelEvent::Opened(c)) if c.local_cid == cid => {
+                self.open_channel(handler, cid, channel);
+            }
+            (
+                Step::Lookup { cid } | Step::Session { cid, .. },
+                ChannelEvent::Failed(c) | ChannelEvent::Closed(c),
+            ) if c.local_cid == cid => {
+                self.fail_profile(handler, ProfileError::ChannelRefused);
+            }
+            _ => {}
+        }
+    }
+
+    /// The SDP lookup on channel `cid` gave `lookup`; a continuation request
+    /// is in `request`.
+    fn on_lookup<H: Handler>(&mut self, handler: &mut H, cid: u16, lookup: Lookup, request: &[u8]) {
+        let Some(pending) = self.profile else {
+            return;
+        };
+        if !matches!(pending.step, Step::Lookup { cid: c } if c == cid) {
+            return;
+        }
+        let channel = match lookup {
+            Lookup::Next(n) => {
+                if self.l2cap.send(cid, &request[..n]).is_err() {
+                    self.l2cap.disconnect(cid);
+                    self.fail_profile(handler, ProfileError::NoResources);
+                }
+                return;
+            }
+            Lookup::Found(channel) => channel,
+            Lookup::NotFound => {
+                self.l2cap.disconnect(cid);
+                return self.fail_profile(handler, ProfileError::NotFound);
+            }
+            Lookup::Failed => {
+                self.l2cap.disconnect(cid);
+                return self.fail_profile(handler, ProfileError::LookupFailed);
+            }
+        };
+        // Not a failure from here on if the SDP channel closes.
+        self.profile = Some(Pending {
+            step: Step::Session { cid: 0, channel },
+            ..pending
+        });
+        self.l2cap.disconnect(cid);
+        // One RFCOMM session per pair of devices: reuse one either side
+        // opened.
+        if let Some(session) = self.l2cap.find(pending.handle, rfcomm::PSM) {
+            let cid = session.local_cid;
+            return self.open_channel(handler, cid, channel);
+        }
+        match self.l2cap.connect(pending.handle, rfcomm::PSM) {
+            Some(cid) => {
+                self.profile = Some(Pending {
+                    step: Step::Session { cid, channel },
+                    ..pending
+                });
+            }
+            None => self.fail_profile(handler, ProfileError::NoResources),
+        }
+    }
+
+    /// Opens RFCOMM `channel` on the session over L2CAP channel `cid`.
+    fn open_channel<H: Handler>(&mut self, handler: &mut H, cid: u16, channel: u8) {
+        let Some(pending) = self.profile else {
+            return;
+        };
+        match self.rfcomm.connect(cid, channel) {
+            Some(dlc) => {
+                self.profile = Some(Pending {
+                    step: Step::Channel { dlc },
+                    ..pending
+                });
+            }
+            None => self.fail_profile(handler, ProfileError::NoResources),
         }
     }
 }
@@ -272,11 +511,15 @@ impl Credits {
 /// blocked on a full queue would deadlock both. When the queue is full the
 /// packet is dropped instead and counted, and [`Handler::events_dropped`]
 /// reports it.
+///
+/// `requests` carries what the application asks of the stack, such as
+/// [`Requests::connect_profile`].
 pub async fn run<C, S, H>(
     controller: &C,
     stack: &mut Stack<'_, S>,
     gap: &gap::Config<'_>,
     handler: &mut H,
+    requests: &Requests,
 ) -> Error<C::Error>
 where
     C: HostController,
@@ -342,21 +585,35 @@ where
 
         let mut response = [0u8; l2cap::MTU as usize];
         loop {
-            let packet = queue.receive().await;
+            let packet = match select(queue.receive(), requests.channel.receive()).await {
+                Either::First(packet) => Some(packet),
+                Either::Second(Request::ConnectProfile { bd_addr, uuid }) => {
+                    stack.start_profile(handler, bd_addr, uuid);
+                    None
+                }
+            };
             let lost = dropped.replace(0);
             if lost > 0 {
                 handler.events_dropped(lost);
             }
             match packet {
-                Packet::Event { bytes, len } => {
+                None => {}
+                Some(Packet::Event { bytes, len }) => {
                     let Ok(event) = Event::from_hci_bytes_complete(&bytes[..len]) else {
                         continue;
                     };
                     handler.event(&event);
                     let out = stack.security.on_event(&event, &mut stack.keys);
                     match out.notice {
-                        Some(Notice::Connected { handle, .. }) => stack.l2cap.connected(handle),
+                        Some(Notice::Connected { handle, bd_addr }) => {
+                            stack.l2cap.connected(handle);
+                            stack.link_up(handle, bd_addr);
+                        }
                         Some(Notice::Disconnected { handle, .. }) => {
+                            if stack.profile.is_some_and(|p| p.handle == handle) {
+                                stack.fail_profile(handler, ProfileError::Disconnected);
+                            }
+                            stack.link_down(handle);
                             stack.l2cap.disconnected(handle);
                             credits.reclaim(handle);
                         }
@@ -383,15 +640,19 @@ where
                         }
                     }
                 }
-                Packet::Acl {
+                Some(Packet::Acl {
                     handle,
                     boundary,
                     data,
                     len,
-                } => {
+                }) => {
                     if let Some(received) = stack.l2cap.on_acl(handle, boundary, &data[..len]) {
                         let channel = received.channel;
-                        if channel.psm == sdp::PSM {
+                        if channel.psm == sdp::PSM && channel.outgoing {
+                            let mut request = [0u8; sdp::MAX_CLIENT_REQUEST];
+                            let lookup = stack.sdp_client.on_response(received.data, &mut request);
+                            stack.on_lookup(handler, channel.local_cid, lookup, &request);
+                        } else if channel.psm == sdp::PSM {
                             let n =
                                 stack
                                     .sdp
@@ -425,17 +686,34 @@ where
                     }
                     _ => {}
                 }
+                stack.on_profile_channel(handler, event);
                 handler.channel(event);
             }
             while let Some(event) = stack.rfcomm.pop_event() {
-                match event {
-                    RfcommEvent::Opened(dlc) => {
+                let profile = stack.profile.filter(|p| match (p.step, event) {
+                    (Step::Channel { dlc }, RfcommEvent::Opened(d) | RfcommEvent::Failed(d)) => {
+                        d == dlc
+                    }
+                    _ => false,
+                });
+                if profile.is_some() {
+                    stack.profile = None;
+                }
+                match (event, profile) {
+                    (RfcommEvent::Opened(dlc), profile) => {
                         let mut tx = RfcommTx {
                             rfcomm: &mut stack.rfcomm,
                         };
+                        if let Some(p) = profile {
+                            handler.profile_connected(p.bd_addr, p.uuid, dlc, &mut tx);
+                        }
                         handler.rfcomm_opened(dlc, &mut tx);
                     }
-                    RfcommEvent::Closed(dlc) => handler.rfcomm_closed(dlc),
+                    (RfcommEvent::Closed(dlc), _) => handler.rfcomm_closed(dlc),
+                    (RfcommEvent::Failed(_), Some(p)) => {
+                        handler.profile_failed(p.bd_addr, p.uuid, ProfileError::Refused);
+                    }
+                    (RfcommEvent::Failed(_), None) => {}
                 }
             }
 
