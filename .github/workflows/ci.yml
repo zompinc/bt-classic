@@ -58,8 +58,10 @@ jobs:
       # rootcanal gives each TCP connection its own controller, all on one
       # virtual radio: host-h4 brings one up, the inquiry example must find
       # the discoverable one and read its name, the pair example must pair
-      # with it, then reconnect on the bond, and Bumble must read its SDP
-      # records and get its data echoed over RFCOMM.
+      # with it, then reconnect on the bond and connect its headset profile,
+      # and Bumble must read its SDP records and get its data echoed over
+      # RFCOMM. Last, Bumble plays a phone's headset gateway and the pair
+      # example connects that profile on it.
       - name: Against rootcanal
         run: |
           sh scripts/rootcanal.sh < /dev/null > rootcanal.log 2>&1 &
@@ -73,9 +75,14 @@ jobs:
           target/debug/examples/discoverable --quiet --btsnoop discoverable.btsnoop < /dev/null > discoverable.log 2>&1 &
           sleep 3
           timeout 60 target/debug/examples/inquiry --seconds 3 --expect bt-classic --btsnoop inquiry.btsnoop
-          timeout 120 target/debug/examples/pair --quiet --expect bt-classic --rounds 2 --btsnoop pair.btsnoop
+          timeout 120 target/debug/examples/pair --quiet --expect bt-classic --rounds 2 --profile 1108 --btsnoop pair.btsnoop
           timeout 120 python tests/peer/sdp_check.py tcp-client:127.0.0.1:6402 bt-classic
           timeout 120 python tests/peer/rfcomm_check.py tcp-client:127.0.0.1:6402 bt-classic
+          timeout 90 python tests/peer/profile_check.py tcp-client:127.0.0.1:6402 > profile_check.log 2>&1 &
+          gateway=$!
+          sleep 3
+          timeout 60 target/debug/examples/pair --quiet --expect bumble-ag --rounds 1 --profile 1112 --btsnoop profile.btsnoop
+          wait "$gateway" || { cat profile_check.log; exit 1; }
 
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
@@ -85,5 +92,6 @@ jobs:
             rootcanal.log
             *.btsnoop
             discoverable.log
+            profile_check.log
           if-no-files-found: ignore
           retention-days: 5

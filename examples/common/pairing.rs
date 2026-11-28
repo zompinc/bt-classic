@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use bt_classic::gap;
 use bt_classic::gap::ControllerInfo;
-use bt_classic::host::{Handler, RfcommTx};
+use bt_classic::host::{Handler, ProfileError, RfcommTx};
 use bt_classic::l2cap::ChannelEvent;
 use bt_classic::rfcomm::Dlc;
 use bt_classic::security::{
@@ -111,13 +111,19 @@ pub enum Progress {
         name: Option<String>,
     },
     InquiryComplete,
+    /// The outcome of a profile connection.
+    Profile(Result<Dlc, ProfileError>),
+    /// Data on an RFCOMM channel, when not echoing.
+    Data(Dlc, Vec<u8>),
 }
 
 /// Prints notices and forwards them, with inquiry results, to `tx`. With
-/// `echo`, sends RFCOMM data straight back.
+/// `echo`, sends RFCOMM data straight back. `greeting` is sent on every
+/// profile channel that opens.
 pub struct Console {
     pub tx: UnboundedSender<Progress>,
     pub echo: bool,
+    pub greeting: Vec<u8>,
 }
 
 impl Handler for Console {
@@ -153,11 +159,33 @@ impl Handler for Console {
             dlc.channel(),
             data.len()
         );
-        if self.echo
-            && let Err(e) = tx.send(dlc, data)
-        {
+        if !self.echo {
+            let _ = self.tx.send(Progress::Data(dlc, data.to_vec()));
+        } else if let Err(e) = tx.send(dlc, data) {
             println!("   echo dropped: {e:?}");
         }
+    }
+
+    fn profile_connected(&mut self, bd_addr: BdAddr, uuid: u16, dlc: Dlc, tx: &mut RfcommTx<'_>) {
+        println!(
+            "   profile 0x{uuid:04x} connected to {} on RFCOMM channel {}",
+            addr(&bd_addr),
+            dlc.channel()
+        );
+        if !self.greeting.is_empty()
+            && let Err(e) = tx.send(dlc, &self.greeting)
+        {
+            println!("   greeting dropped: {e:?}");
+        }
+        let _ = self.tx.send(Progress::Profile(Ok(dlc)));
+    }
+
+    fn profile_failed(&mut self, bd_addr: BdAddr, uuid: u16, error: ProfileError) {
+        println!(
+            "   profile 0x{uuid:04x} on {} failed: {error:?}",
+            addr(&bd_addr)
+        );
+        let _ = self.tx.send(Progress::Profile(Err(error)));
     }
 
     fn rfcomm_closed(&mut self, dlc: Dlc) {

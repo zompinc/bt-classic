@@ -8,12 +8,12 @@ See [docs/design.md](docs/design.md) for the research behind it, the layout and 
 
 ## Status
 
-Milestone 4: a controller comes up discoverable and connectable, accepts connections, pairs with Secure Simple Pairing (Just Works or numeric comparison), stores link keys, reconnects bonded devices without pairing again, answers SDP queries, and serves RFCOMM channels that a phone opens. Running it on an ESP32 comes next.
+Milestone 4: a controller comes up discoverable and connectable, accepts connections, pairs with Secure Simple Pairing (Just Works or numeric comparison), stores link keys, reconnects bonded devices without pairing again, answers SDP queries, and serves RFCOMM channels that a phone opens. It also runs on the ESP32 itself (`firmware/esp32`), and connects profiles on a peer the way a headset connects to a phone: `Requests::connect_profile` looks the service up with SDP and opens its RFCOMM channel.
 
-- `host`: the async runner (`host::run`) that brings the controller up, reads it, drives pairing, L2CAP and SDP, and sends their replies, with a `Handler` for progress and numeric-comparison prompts.
-- `l2cap`: basic-mode L2CAP with no I/O: signaling, channels the peer opens, MTU configuration, reassembly.
-- `sdp`: an SDP server for static service records, with continuation; `rfcomm_service_record!` builds the usual RFCOMM record.
-- `rfcomm`: an RFCOMM server with no I/O: the multiplexer, parameter negotiation and credit-based flow control.
+- `host`: the async runner (`host::run`) that brings the controller up, reads it, drives pairing, L2CAP, SDP and RFCOMM, and sends their replies, with a `Handler` for progress and numeric-comparison prompts, and `Requests` for profile connections.
+- `l2cap`: basic-mode L2CAP with no I/O: signaling, channels either side opens, MTU configuration, reassembly.
+- `sdp`: an SDP server for static service records, with continuation, and a client that looks up a service's RFCOMM channel; `rfcomm_service_record!` builds the usual RFCOMM record.
+- `rfcomm`: RFCOMM with no I/O, as either side: the multiplexer, parameter negotiation and credit-based flow control.
 - `transport`: `SplitAcl`, which keeps incoming ACL packets within bt-hci's read buffer whatever the controller sends.
 - `security`: the pairing state machine, with no I/O, and the `LinkKeyStore` trait (`MemoryKeyStore` keeps keys in RAM).
 - `gap`: the bring-up sequence (`gap::bring_up`), Class of Device, the local name, and building and parsing EIR data.

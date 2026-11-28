@@ -15,7 +15,7 @@
 mod common;
 
 use bt_classic::gap::{self, ClassOfDevice, audio_video, major, service};
-use bt_classic::host::{self, Stack};
+use bt_classic::host::{self, Requests, Stack};
 use bt_classic::rfcomm_service_record;
 use bt_classic::sdp::{Attribute, DataElement, ServiceRecord, attribute, uuid};
 use bt_classic::security::SecurityConfig;
@@ -70,10 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Progress is printed by the console; nothing here waits for it.
     let (tx, _rx) = mpsc::unbounded_channel();
-    let mut console = Console { tx, echo: true };
+    let mut console = Console {
+        tx,
+        echo: true,
+        greeting: Vec::new(),
+    };
     let mut stack = Stack::new(SecurityConfig::default(), &RECORDS, keys);
     stack.rfcomm.register(8);
     stack.rfcomm.register(6);
-    let error = host::run(&hci, &mut stack, &config, &mut console).await;
+    let requests = Requests::new();
+    let error = host::run(&hci, &mut stack, &config, &mut console, &requests).await;
     Err(format!("controller failed: {error:?}").into())
 }

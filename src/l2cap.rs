@@ -260,6 +260,14 @@ impl L2cap {
             .find(|c| c.local_cid == local_cid)
     }
 
+    /// An open channel to `psm` on the link `handle`, if any.
+    pub fn find(&self, handle: ConnHandle, psm: u16) -> Option<&Channel> {
+        self.channels
+            .iter()
+            .flatten()
+            .find(|c| c.handle == handle && c.psm == psm && c.is_open())
+    }
+
     /// How many more PDUs the outbox takes.
     pub fn outbox_room(&self) -> usize {
         self.outbox.iter().filter(|o| o.is_none()).count()
